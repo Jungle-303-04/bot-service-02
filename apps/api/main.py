@@ -31,9 +31,9 @@ LOCK_SECONDS = int(os.getenv("LOCK_SECONDS", "35"))
 CPU_BURN_SECONDS = int(os.getenv("CPU_BURN_SECONDS", "45"))
 KUBE_NAMESPACE = os.getenv("KUBE_NAMESPACE", "sandbox")
 DEPLOYMENT_NAME = os.getenv("DEPLOYMENT_NAME", f"{SERVICE_NAME}-api")
-BASE_REPLICAS = int(os.getenv("BASE_REPLICAS", "2"))
+BASE_REPLICAS = int(os.getenv("BASE_REPLICAS", "1"))
 SURGE_REPLICAS = int(os.getenv("SURGE_REPLICAS", "6"))
-HPA_MAX_REPLICAS = int(os.getenv("HPA_MAX_REPLICAS", "8"))
+HPA_MAX_REPLICAS = int(os.getenv("HPA_MAX_REPLICAS", "10"))
 KUBE_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 KUBE_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
@@ -460,6 +460,10 @@ def live_release_version(label: str) -> str:
     return f"v1.2.{int(time.time()) % 10000}-{label}"
 
 
+def replicas_for_tps(target_tps: int) -> int:
+    return max(BASE_REPLICAS, min(HPA_MAX_REPLICAS, (max(1, target_tps) + 999) // 1000))
+
+
 async def cpu_burn() -> None:
     await set_scenario("load", True)
     deadline = time.monotonic() + CPU_BURN_SECONDS
@@ -670,20 +674,32 @@ async def work_unit(request: Request) -> dict[str, Any]:
         payload = {}
     bot_id = str(payload.get("bot_id", "bot-unknown"))[:64]
     failure_rate = max(0.0, min(0.8, float(payload.get("failure_rate", 0) or 0)))
+    units = max(1, min(1000, int(payload.get("units", 1) or 1)))
     pressure = 0.07 if scenario_state["scale_surge"] or scenario_state["load"] else 0.025
+    pressure = min(0.14, pressure + units / 24000)
     checksum = local_cpu_work(pressure)
-    failed = random.random() < failure_rate
+    failures = sum(1 for _ in range(units) if random.random() < failure_rate)
+    successes = units - failures
+    failed = failures > 0
     async with current_pool().acquire() as conn:
         if SERVICE_KIND == "fleet":
             job_id = await conn.fetchval(
                 "INSERT INTO jobs(status, payload) VALUES($1, $2::jsonb) RETURNING id",
                 "failed" if failed else "queued",
-                json_arg({"source": "traffic-surge", "bot_id": bot_id, "checksum": checksum, "service": SERVICE_NAME}),
+                json_arg({
+                    "source": "traffic-surge",
+                    "bot_id": bot_id,
+                    "units": units,
+                    "successes": successes,
+                    "failures": failures,
+                    "checksum": checksum,
+                    "service": SERVICE_NAME,
+                }),
             )
             await conn.execute(
                 "INSERT INTO bot_events(event_type, payload) VALUES($1, $2::jsonb)",
                 "traffic.failed" if failed else "traffic.work",
-                json_arg({"job_id": job_id, "bot_id": bot_id}),
+                json_arg({"job_id": job_id, "bot_id": bot_id, "units": units, "successes": successes, "failures": failures}),
             )
             target_bot = random.randint(1, 18)
             await conn.execute("UPDATE bots SET status = 'busy', current_load = $1, updated_at = now() WHERE id = $2", random.randint(35, 99), target_bot)
@@ -691,16 +707,33 @@ async def work_unit(request: Request) -> dict[str, Any]:
             await conn.execute(
                 "INSERT INTO audit_logs(event_type, payload) VALUES($1, $2::jsonb)",
                 "traffic.failed" if failed else "traffic.work",
-                json_arg({"bot_id": bot_id, "checksum": checksum, "service": SERVICE_NAME, "at": utc_now()}),
+                json_arg({
+                    "bot_id": bot_id,
+                    "units": units,
+                    "successes": successes,
+                    "failures": failures,
+                    "checksum": checksum,
+                    "service": SERVICE_NAME,
+                    "at": utc_now(),
+                }),
             )
             await conn.execute(
                 "INSERT INTO telemetry_samples(metric, value) VALUES($1, $2)",
                 "checkout.failed" if failed else "checkout.work",
-                0 if failed else random.random() * 100,
+                failures if failed else successes,
             )
     if failed:
         ERRORS.labels(SERVICE_NAME, "bot_work_failed").inc()
-    return {"ok": not failed, "status": "failed" if failed else "accepted", "bot_id": bot_id, "checksum": checksum, "service": SERVICE_NAME}
+    return {
+        "ok": not failed,
+        "status": "failed" if failed else "accepted",
+        "bot_id": bot_id,
+        "units": units,
+        "success": successes,
+        "failure": failures,
+        "checksum": checksum,
+        "service": SERVICE_NAME,
+    }
 
 
 @app.get("/api/bots")
