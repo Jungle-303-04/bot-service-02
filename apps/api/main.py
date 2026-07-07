@@ -589,6 +589,12 @@ async def receiver_loop() -> None:
 
         if processed > 0:
             local_cpu_work(min(0.09, processed / 24000))
+            await exec_db(
+                "traffic_processed_event",
+                "INSERT INTO bot_events(event_type, payload) VALUES($1, $2::jsonb)",
+                "traffic.processed",
+                json_arg({"processed": processed, "queue_depth": queue_depth, "pod": POD_NAME, "service": SERVICE_NAME, "at": utc_now()}),
+            )
 
         if now - last_metric >= 1:
             last_metric = now
@@ -597,12 +603,6 @@ async def receiver_loop() -> None:
                 "INSERT INTO telemetry_samples(metric, value) VALUES($1, $2)",
                 "traffic.link.processed",
                 processed,
-            )
-            await exec_db(
-                "traffic_processed_event",
-                "INSERT INTO bot_events(event_type, payload) VALUES($1, $2::jsonb)",
-                "traffic.processed",
-                json_arg({"processed": processed, "queue_depth": queue_depth, "pod": POD_NAME, "service": SERVICE_NAME, "at": utc_now()}),
             )
         await asyncio.sleep(0.2)
 
