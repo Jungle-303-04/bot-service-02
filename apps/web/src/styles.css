@@ -1,0 +1,58 @@
+:root {
+  --bg: #080b12;
+  --surface: #101725;
+  --surface-2: #172033;
+  --line: #253149;
+  --text: #f0f6ff;
+  --muted: #8ea0ba;
+  --cyan: #67e8f9;
+  --blue: #60a5fa;
+  --violet: #a78bfa;
+  --amber: #fbbf24;
+  --red: #fb7185;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--text); background: radial-gradient(circle at 72% 8%, #183b56 0, transparent 34%), linear-gradient(180deg, #080b12 0%, #0d111a 100%); }
+button { font: inherit; }
+.shell { width: min(1220px, calc(100vw - 32px)); margin: 0 auto; padding: 30px 0; }
+.hero { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 28px; align-items: center; margin-bottom: 22px; }
+.label { color: var(--cyan); font-size: 12px; font-weight: 900; letter-spacing: .14em; text-transform: uppercase; margin: 0 0 8px; }
+h1 { margin: 0; font-size: clamp(38px, 8vw, 84px); letter-spacing: -0.055em; line-height: .9; }
+.copy { color: var(--muted); max-width: 640px; line-height: 1.65; margin: 16px 0 0; }
+.orbital { position: relative; width: 240px; height: 240px; border: 1px solid var(--line); border-radius: 50%; background: radial-gradient(circle, rgb(103 232 249 / .18), transparent 58%); justify-self: end; }
+.orbital span { position: absolute; left: 50%; top: 50%; width: 9px; height: 9px; border-radius: 50%; background: var(--cyan); transform: rotate(calc(var(--i) * 25.7deg)) translateX(108px); animation: blink 1.8s ease-in-out infinite; animation-delay: calc(var(--i) * 80ms); }
+@keyframes blink { 50% { opacity: .35; transform: rotate(calc(var(--i) * 25.7deg)) translateX(94px) scale(.8); } }
+.topology { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; }
+.swarm { --pressure: 0; min-height: 520px; border: 1px solid var(--line); background: rgb(16 23 37 / .82); border-radius: 8px; padding: 16px; display: grid; grid-template-columns: repeat(auto-fill, minmax(106px, 1fr)); gap: 10px; align-content: start; box-shadow: 0 18px 55px rgb(0 0 0 / .32); }
+.bot { min-height: 74px; border: 1px solid color-mix(in oklab, var(--line) calc((1 - var(--pressure)) * 100%), var(--red) calc(var(--pressure) * 100%)); border-radius: 7px; padding: 10px; background: color-mix(in oklab, #152237 calc((1 - var(--pressure)) * 100%), #4c1525 calc(var(--pressure) * 100%)); animation: botWork 1.4s ease-in-out infinite; }
+.bot b { display: block; font-size: 13px; margin-bottom: 7px; }
+.bot span { display: inline-flex; color: var(--muted); font-size: 11px; }
+@keyframes botWork { 50% { transform: translateY(calc(var(--pressure) * -5px)); filter: brightness(calc(1 + var(--pressure) * .45)); } }
+.panel { border: 1px solid var(--line); background: rgb(16 23 37 / .9); border-radius: 8px; padding: 16px; box-shadow: 0 18px 50px rgb(0 0 0 / .22); }
+.panel-title { display: flex; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
+.panel-title span { color: var(--muted); font-size: 12px; text-align: right; }
+.actions { display: grid; gap: 8px; }
+.actions button, .duo button { cursor: pointer; border: 1px solid var(--line); color: var(--text); background: var(--surface-2); border-radius: 7px; padding: 10px; text-align: left; transition: border-color .16s ease, transform .16s ease, background .16s ease; }
+.actions button:hover, .duo button:hover { border-color: var(--cyan); transform: translateY(-1px); }
+.actions button span { display: block; font-weight: 900; }
+.actions button small { display: block; color: var(--muted); margin-top: 4px; line-height: 1.35; }
+.duo { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+.duo button { text-align: center; background: var(--cyan); color: #061016; border: 0; font-weight: 900; }
+.metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 16px 0; }
+.metric { border: 1px solid var(--line); background: rgb(23 32 51 / .86); border-radius: 8px; padding: 16px; }
+.metric span { color: var(--muted); font-size: 12px; }
+.metric strong { display: block; margin-top: 4px; font-size: 30px; font-variant-numeric: tabular-nums; }
+.version { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px; }
+.version div { border-right: 1px solid var(--line); min-width: 0; }
+.version div:last-child { border-right: 0; }
+.version span { display: block; color: var(--muted); font-size: 12px; }
+.version strong { display: block; margin-top: 5px; overflow-wrap: anywhere; }
+@media (max-width: 920px) {
+  .hero, .topology { grid-template-columns: 1fr; }
+  .orbital { justify-self: start; width: 180px; height: 180px; }
+  .orbital span { transform: rotate(calc(var(--i) * 25.7deg)) translateX(78px); }
+  .metrics, .version { grid-template-columns: repeat(2, 1fr); }
+}
+
