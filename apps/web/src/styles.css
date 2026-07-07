@@ -65,6 +65,27 @@ button:disabled { opacity: .58; cursor: wait; transform: none; }
 .pod.pending { border-color: color-mix(in oklab, var(--warn) 60%, var(--line)); }
 .pod b { display: block; font-size: 13px; overflow-wrap: anywhere; }
 .pod span, .pod em { display: block; color: var(--muted); font-size: 11px; font-style: normal; margin-top: 5px; }
+.load-panel { margin-top: 12px; --load: 0; }
+.cell-field {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9px, 1fr));
+  gap: 4px;
+  max-height: 246px;
+  overflow: hidden;
+}
+.cell-field i {
+  aspect-ratio: 1;
+  border-radius: 2px;
+  background: color-mix(in oklab, var(--ok) calc((1 - var(--load)) * 100%), var(--bad) calc(var(--load) * 100%));
+  opacity: calc(.22 + var(--load) * .72);
+  animation: loadPulse 1.2s ease-in-out infinite;
+}
+.cell-field i:nth-child(3n) { animation-delay: 90ms; }
+.cell-field i:nth-child(5n) { animation-delay: 180ms; }
+.cell-field i:nth-child(7n) { animation-delay: 270ms; }
+@keyframes loadPulse {
+  50% { transform: scale(calc(.9 + var(--load) * .18)); filter: brightness(calc(1 + var(--load) * .55)); }
+}
 .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
 .bot-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(86px, 1fr)); gap: 8px; }
 .bot-list span { border: 1px solid var(--line); border-radius: 7px; padding: 10px; color: var(--muted); font-size: 12px; }

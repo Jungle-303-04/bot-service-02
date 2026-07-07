@@ -64,6 +64,7 @@ export default function App() {
   const [bots, setBots] = useState<Bot[]>([]);
   const [notice, setNotice] = useState('운영 상태 확인 중');
   const [busy, setBusy] = useState('');
+  const [loadCells, setLoadCells] = useState(96);
   const stormRef = useRef<number | null>(null);
 
   const refresh = async () => {
@@ -114,6 +115,21 @@ export default function App() {
   const releaseTone = !cluster?.rollout_complete ? 'rolling' : cluster.template_flavor !== 'stable' ? 'fault' : 'stable';
   const rolloutLabel = !cluster?.rollout_complete ? '배포 중' : cluster.template_flavor !== 'stable' ? '장애 버전' : '정상';
   const busyBots = useMemo(() => bots.filter(bot => bot.status === 'busy').length, [bots]);
+  const loadActive = Boolean(status?.scenarios.scale_surge || status?.scenarios.load || status?.scenarios.db_bulk_insert || status?.scenarios.error_spike);
+  const loadPressure = Math.min(1, activeIncidents * 0.18 + Math.max(desired - 2, 0) * 0.1 + (busyBots / Math.max(1, bots.length)) * 0.28 + (cluster?.template_flavor !== 'stable' ? 0.32 : 0));
+  const loadTarget = loadActive ? 1000 : desired > 2 ? 360 : 96;
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setLoadCells((current) => {
+        if (current === loadTarget) return current;
+        const step = current < loadTarget ? Math.max(12, Math.ceil((loadTarget - current) / 6)) : -Math.max(16, Math.ceil((current - loadTarget) / 5));
+        const next = current + step;
+        return step > 0 ? Math.min(next, loadTarget) : Math.max(next, loadTarget);
+      });
+    }, 160);
+    return () => window.clearInterval(id);
+  }, [loadTarget]);
 
   const runRelease = async (action: 'deploy' | 'faulty' | 'rollback', label: string) => {
     setBusy(label);
@@ -229,6 +245,16 @@ export default function App() {
             ))}
           </div>
         </section>
+      </section>
+
+      <section className="panel load-panel" style={{ ['--load' as string]: loadPressure }}>
+        <div className="panel-title">
+          <strong>부하 확산</strong>
+          <span>{loadCells.toLocaleString()} 작업 셀 · 실제 파드 {ready}/{desired}</span>
+        </div>
+        <div className="cell-field">
+          {Array.from({ length: loadCells }, (_, index) => <i key={index} />)}
+        </div>
       </section>
 
       <section className="data-grid">
