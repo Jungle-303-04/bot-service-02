@@ -799,7 +799,8 @@ async def metrics() -> Response:
 
 
 @app.get("/api/status")
-async def status() -> dict[str, Any]:
+async def status(response: Response) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
     scenarios = await sync_scenarios_from_db(force=True)
     counts, cluster = await asyncio.gather(refresh_row_gauges(), cluster_snapshot())
     traffic = await traffic_snapshot(cluster)

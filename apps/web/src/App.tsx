@@ -36,7 +36,8 @@ interface PodBox {
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, { ...init, headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) } });
+  const url = init?.method && init.method !== 'GET' ? path : `${path}${path.includes('?') ? '&' : '?'}_=${Date.now()}`;
+  const res = await fetch(url, { ...init, cache: 'no-store', headers: { 'content-type': 'application/json', 'cache-control': 'no-store', ...(init?.headers ?? {}) } });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
