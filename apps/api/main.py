@@ -33,6 +33,7 @@ KUBE_NAMESPACE = os.getenv("KUBE_NAMESPACE", "sandbox")
 DEPLOYMENT_NAME = os.getenv("DEPLOYMENT_NAME", f"{SERVICE_NAME}-api")
 BASE_REPLICAS = int(os.getenv("BASE_REPLICAS", "2"))
 SURGE_REPLICAS = int(os.getenv("SURGE_REPLICAS", "6"))
+HPA_MAX_REPLICAS = int(os.getenv("HPA_MAX_REPLICAS", "8"))
 KUBE_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 KUBE_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
@@ -393,13 +394,13 @@ async def scale_api_deployment(replicas: int) -> dict[str, Any]:
     )
 
 
-async def patch_hpa_min_replicas(replicas: int) -> dict[str, Any] | None:
+async def patch_hpa_bounds(min_replicas: int, max_replicas: int) -> dict[str, Any] | None:
     if not kube_available():
         raise RuntimeError("Kubernetes service account is not available")
     return await kube_json(
         "PATCH",
         f"/apis/autoscaling/v2/namespaces/{KUBE_NAMESPACE}/horizontalpodautoscalers/{DEPLOYMENT_NAME}",
-        {"spec": {"minReplicas": replicas}},
+        {"spec": {"minReplicas": min_replicas, "maxReplicas": max_replicas}},
     )
 
 
@@ -670,7 +671,7 @@ async def stop_load() -> dict[str, Any]:
 async def start_scale_surge() -> dict[str, Any]:
     await set_scenario("scale_surge", True)
     try:
-        await patch_hpa_min_replicas(SURGE_REPLICAS)
+        await patch_hpa_bounds(SURGE_REPLICAS, HPA_MAX_REPLICAS)
         scale = await scale_api_deployment(SURGE_REPLICAS)
     except RuntimeError as exc:
         await set_scenario("scale_surge", False)
@@ -689,7 +690,7 @@ async def start_scale_surge() -> dict[str, Any]:
 @app.post("/api/scenarios/scale-surge/stop")
 async def stop_scale_surge() -> dict[str, Any]:
     try:
-        await patch_hpa_min_replicas(BASE_REPLICAS)
+        await patch_hpa_bounds(BASE_REPLICAS, BASE_REPLICAS)
         scale = await scale_api_deployment(BASE_REPLICAS)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -743,7 +744,7 @@ async def recover() -> dict[str, Any]:
     scale_error = None
     if kube_available():
         try:
-            await patch_hpa_min_replicas(BASE_REPLICAS)
+            await patch_hpa_bounds(BASE_REPLICAS, BASE_REPLICAS)
             await scale_api_deployment(BASE_REPLICAS)
         except RuntimeError as exc:
             scale_error = str(exc)
