@@ -23,6 +23,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, ge
 SERVICE_NAME = os.getenv("SERVICE_NAME", "bot-service-02")
 SERVICE_TITLE = os.getenv("SERVICE_TITLE", "Fleet Swarm")
 SERVICE_KIND = os.getenv("SERVICE_KIND", "fleet")
+POD_NAME = os.getenv("HOSTNAME", SERVICE_NAME)
 APP_VERSION = os.getenv("APP_VERSION", "v1.0.0-stable")
 APP_FLAVOR = os.getenv("APP_FLAVOR", "stable")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/bot_service_02")
@@ -34,7 +35,7 @@ DEPLOYMENT_NAME = os.getenv("DEPLOYMENT_NAME", f"{SERVICE_NAME}-api")
 BASE_REPLICAS = int(os.getenv("BASE_REPLICAS", "1"))
 SURGE_REPLICAS = int(os.getenv("SURGE_REPLICAS", "6"))
 HPA_MAX_REPLICAS = int(os.getenv("HPA_MAX_REPLICAS", "10"))
-MAX_TRAFFIC_TPS = int(os.getenv("MAX_TRAFFIC_TPS", "10000"))
+MAX_TRAFFIC_TPS = int(os.getenv("MAX_TRAFFIC_TPS", "0"))
 RECEIVER_CAPACITY_PER_POD = int(os.getenv("RECEIVER_CAPACITY_PER_POD", "1200"))
 KUBE_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 KUBE_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
@@ -73,6 +74,8 @@ traffic_state: dict[str, Any] = {
     "received_total": 0,
     "processed_total": 0,
     "failed_total": 0,
+    "received_per_second": 0,
+    "processed_per_second": 0,
     "last_tick": time.monotonic(),
     "updated_at": "",
 }
@@ -481,7 +484,7 @@ def live_release_version(label: str) -> str:
 
 
 def replicas_for_tps(target_tps: int) -> int:
-    return max(BASE_REPLICAS, min(HPA_MAX_REPLICAS, (max(1, target_tps) + 999) // 1000))
+    return max(BASE_REPLICAS, (max(1, target_tps) + 999) // 1000)
 
 
 def clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -492,17 +495,25 @@ def clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, parsed))
 
 
+def positive_int(value: Any, default: int = 1000) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, parsed)
+
+
 def parse_traffic_payload(payload: dict[str, Any]) -> tuple[int, str, int]:
-    target_tps = clamp_int(payload.get("target_tps"), 1000, 1, MAX_TRAFFIC_TPS)
+    target_tps = positive_int(payload.get("target_tps"), 1000)
     mode = str(payload.get("mode", "manual")).lower()
     if mode not in {"manual", "auto"}:
         mode = "manual"
-    manual_replicas = clamp_int(payload.get("manual_replicas"), BASE_REPLICAS, 1, HPA_MAX_REPLICAS)
+    manual_replicas = positive_int(payload.get("manual_replicas"), BASE_REPLICAS)
     return target_tps, mode, manual_replicas
 
 
 def receiver_replicas_for_tps(target_tps: int) -> int:
-    return max(BASE_REPLICAS, min(HPA_MAX_REPLICAS, (max(1, target_tps) + RECEIVER_CAPACITY_PER_POD - 1) // RECEIVER_CAPACITY_PER_POD))
+    return max(BASE_REPLICAS, (max(1, target_tps) + RECEIVER_CAPACITY_PER_POD - 1) // RECEIVER_CAPACITY_PER_POD)
 
 
 def target_replicas_for_mode(target_tps: int, mode: str, manual_replicas: int) -> int:
@@ -511,7 +522,7 @@ def target_replicas_for_mode(target_tps: int, mode: str, manual_replicas: int) -
 
 async def apply_receiver_replicas(target_tps: int, mode: str, manual_replicas: int) -> dict[str, Any]:
     target_replicas = target_replicas_for_mode(target_tps, mode, manual_replicas)
-    hpa_max = target_replicas if mode == "manual" else HPA_MAX_REPLICAS
+    hpa_max = max(target_replicas, HPA_MAX_REPLICAS)
     await patch_hpa_bounds(target_replicas, hpa_max)
     scale = await scale_api_deployment(target_replicas)
     return {
@@ -538,6 +549,7 @@ async def record_receiver_batch(units: int, accepted: int, failed: int) -> None:
             "accepted": accepted,
             "failed": failed,
             "queue_depth": round(float(traffic_state["queue_depth"])),
+            "pod": POD_NAME,
             "service": SERVICE_NAME,
             "at": utc_now(),
         }),
@@ -567,12 +579,13 @@ async def receiver_loop() -> None:
         async with traffic_lock:
             elapsed = max(0.05, now - float(traffic_state["last_tick"]))
             traffic_state["last_tick"] = now
-            ready = max(1, int(traffic_state["ready_replicas"]))
-            process_capacity = ready * RECEIVER_CAPACITY_PER_POD * elapsed
+            process_capacity = RECEIVER_CAPACITY_PER_POD * elapsed
             processed = int(min(float(traffic_state["queue_depth"]), process_capacity))
             traffic_state["queue_depth"] = max(0.0, float(traffic_state["queue_depth"]) - processed)
             traffic_state["processed_total"] = int(traffic_state["processed_total"]) + processed
+            traffic_state["processed_per_second"] = processed
             traffic_state["updated_at"] = utc_now()
+            queue_depth = round(float(traffic_state["queue_depth"]))
 
         if processed > 0:
             local_cpu_work(min(0.09, processed / 24000))
@@ -585,21 +598,62 @@ async def receiver_loop() -> None:
                 "traffic.link.processed",
                 processed,
             )
+            await exec_db(
+                "traffic_processed_event",
+                "INSERT INTO bot_events(event_type, payload) VALUES($1, $2::jsonb)",
+                "traffic.processed",
+                json_arg({"processed": processed, "queue_depth": queue_depth, "pod": POD_NAME, "service": SERVICE_NAME, "at": utc_now()}),
+            )
         await asyncio.sleep(0.2)
 
 
-def traffic_snapshot(cluster: dict[str, Any]) -> dict[str, Any]:
+async def traffic_snapshot(cluster: dict[str, Any]) -> dict[str, Any]:
     ready = max(1, int(cluster.get("ready_replicas") or cluster.get("desired_replicas") or BASE_REPLICAS))
     desired = max(1, int(cluster.get("desired_replicas") or ready))
     traffic_state["ready_replicas"] = ready
     traffic_state["desired_replicas"] = desired
-    queue_depth = float(traffic_state["queue_depth"])
+    pod_rows = await timed_db(
+        "traffic_receiver_pods",
+        """
+        SELECT
+          payload->>'pod' AS pod,
+          COALESCE(SUM((payload->>'units')::bigint) FILTER (
+            WHERE event_type IN ('traffic.received', 'traffic.overloaded')
+              AND created_at >= now() - interval '1 second'
+          ), 0) AS received_per_second,
+          COALESCE(SUM((payload->>'processed')::bigint) FILTER (
+            WHERE event_type = 'traffic.processed'
+              AND created_at >= now() - interval '1 second'
+          ), 0) AS processed_per_second,
+          COALESCE(MAX((payload->>'queue_depth')::double precision), 0) AS queue_depth
+        FROM bot_events
+        WHERE event_type IN ('traffic.received', 'traffic.overloaded', 'traffic.processed')
+          AND created_at >= now() - interval '3 seconds'
+          AND payload ? 'pod'
+        GROUP BY payload->>'pod'
+        """,
+    )
+    pod_stats = {
+        row["pod"]: {
+            "received_per_second": int(row["received_per_second"] or 0),
+            "processed_per_second": int(row["processed_per_second"] or 0),
+            "queue_depth": round(float(row["queue_depth"] or 0)),
+        }
+        for row in pod_rows
+        if row["pod"]
+    }
+    queue_depth = sum(float(item["queue_depth"]) for item in pod_stats.values()) or float(traffic_state["queue_depth"])
+    received_per_second = sum(int(item["received_per_second"]) for item in pod_stats.values())
+    processed_per_second = sum(int(item["processed_per_second"]) for item in pod_stats.values())
     pressure = min(1.0, queue_depth / max(ready * RECEIVER_CAPACITY_PER_POD * 2, 1))
     return {
         **traffic_state,
         "queue_depth": round(queue_depth),
+        "received_per_second": received_per_second,
+        "processed_per_second": processed_per_second,
         "pressure": round(pressure, 3),
         "capacity_per_second": ready * RECEIVER_CAPACITY_PER_POD,
+        "pod_stats": pod_stats,
     }
 
 
@@ -740,6 +794,7 @@ async def metrics() -> Response:
 async def status() -> dict[str, Any]:
     scenarios = await sync_scenarios_from_db(force=True)
     counts, cluster = await asyncio.gather(refresh_row_gauges(), cluster_snapshot())
+    traffic = await traffic_snapshot(cluster)
     samples = list(latency_samples)
     p95 = sorted(samples)[int(len(samples) * 0.95) - 1] if samples else 0
     return {
@@ -757,7 +812,7 @@ async def status() -> dict[str, Any]:
         },
         "rows": counts,
         "cluster": cluster,
-        "traffic": traffic_snapshot(cluster),
+        "traffic": traffic,
     }
 
 
@@ -925,10 +980,20 @@ async def start_receiver(request: Request) -> dict[str, Any]:
     except Exception:
         payload = {}
     target_tps, mode, manual_replicas = parse_traffic_payload(payload)
-    try:
-        scale = await apply_receiver_replicas(target_tps, mode, manual_replicas)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    source = str(payload.get("source", "")).lower()
+    if source == "sender":
+        cluster = await cluster_snapshot()
+        scale = {
+            "target_replicas": int(cluster.get("desired_replicas") or BASE_REPLICAS),
+            "hpa_max_replicas": int(cluster.get("hpa", {}).get("max_replicas") or HPA_MAX_REPLICAS),
+            "observed_replicas": int(cluster.get("desired_replicas") or BASE_REPLICAS),
+        }
+        manual_replicas = int(scale["target_replicas"])
+    else:
+        try:
+            scale = await apply_receiver_replicas(target_tps, mode, manual_replicas)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
     async with traffic_lock:
         traffic_state.update({
             "running": True,
@@ -958,6 +1023,25 @@ async def start_receiver(request: Request) -> dict[str, Any]:
     }
 
 
+@app.post("/api/traffic/receiver/scale")
+async def scale_receiver(request: Request) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    manual_replicas = positive_int(payload.get("manual_replicas"), BASE_REPLICAS)
+    try:
+        scale = await apply_receiver_replicas(1, "manual", manual_replicas)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    async with traffic_lock:
+        traffic_state["manual_replicas"] = manual_replicas
+        traffic_state["desired_replicas"] = manual_replicas
+        traffic_state["updated_at"] = utc_now()
+    return {"status": "scaled", **scale}
+
+
 @app.post("/api/traffic/receiver/stop")
 async def stop_receiver() -> dict[str, Any]:
     async with traffic_lock:
@@ -967,19 +1051,15 @@ async def stop_receiver() -> dict[str, Any]:
             "queue_depth": 0.0,
             "updated_at": utc_now(),
         })
-    try:
-        await patch_hpa_bounds(BASE_REPLICAS, BASE_REPLICAS)
-        scale = await scale_api_deployment(BASE_REPLICAS)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    cluster = await cluster_snapshot()
     await set_scenario("traffic_link", False)
     await set_scenario("scale_surge", False)
     await set_scenario("load", False)
     return {
         "scenario": "traffic_link",
         "status": "receiver_stopped",
-        "target_replicas": BASE_REPLICAS,
-        "observed_replicas": scale.get("spec", {}).get("replicas"),
+        "target_replicas": int(cluster.get("desired_replicas") or BASE_REPLICAS),
+        "observed_replicas": int(cluster.get("desired_replicas") or BASE_REPLICAS),
     }
 
 
@@ -992,7 +1072,7 @@ async def receive_traffic(request: Request) -> dict[str, Any]:
     except Exception:
         payload = {}
     units = clamp_int(payload.get("units"), 1, 1, 1000)
-    target_tps = clamp_int(payload.get("target_tps"), int(traffic_state.get("target_tps") or 1000), 1, MAX_TRAFFIC_TPS)
+    target_tps = positive_int(payload.get("target_tps"), int(traffic_state.get("target_tps") or 1000))
     sender = str(payload.get("sender", "unknown"))[:80]
     should_start_loop = False
     async with traffic_lock:
@@ -1004,13 +1084,14 @@ async def receive_traffic(request: Request) -> dict[str, Any]:
             })
             should_start_loop = True
         ready = max(1, int(traffic_state["ready_replicas"]))
-        queue_limit = ready * RECEIVER_CAPACITY_PER_POD * 6
+        queue_limit = RECEIVER_CAPACITY_PER_POD * 6
         overflow = max(0, int(float(traffic_state["queue_depth"]) + units - queue_limit))
         failed = min(units, overflow)
         accepted = units - failed
         traffic_state["queue_depth"] = max(0.0, float(traffic_state["queue_depth"]) + accepted)
         traffic_state["received_total"] = int(traffic_state["received_total"]) + units
         traffic_state["failed_total"] = int(traffic_state["failed_total"]) + failed
+        traffic_state["received_per_second"] = units
         traffic_state["target_tps"] = target_tps
         traffic_state["updated_at"] = utc_now()
         queue_depth = round(float(traffic_state["queue_depth"]))
