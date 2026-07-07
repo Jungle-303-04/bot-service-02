@@ -69,6 +69,8 @@ scenario_state: dict[str, bool] = {
 background_tasks: set[asyncio.Task[Any]] = set()
 last_scenario_sync = 0.0
 traffic_lock = asyncio.Lock()
+row_gauge_cache: tuple[float, dict[str, int]] = (0.0, {})
+cluster_cache: tuple[float, dict[str, Any]] = (0.0, {})
 receiver_task: asyncio.Task[Any] | None = None
 traffic_state: dict[str, Any] = {
     "role": "receiver",
@@ -191,6 +193,16 @@ async def init_schema() -> None:
               enabled BOOLEAN NOT NULL DEFAULT false,
               updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
+            CREATE TABLE IF NOT EXISTS traffic_runtime (
+              key TEXT PRIMARY KEY,
+              payload JSONB NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE INDEX IF NOT EXISTS idx_bot_events_event_created_at
+              ON bot_events(event_type, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_bot_events_pod_created_at
+              ON bot_events((payload->>'pod'), created_at DESC)
+              WHERE payload ? 'pod';
             """
         )
         await conn.execute(
@@ -232,6 +244,17 @@ async def refresh_row_gauges() -> dict[str, int]:
     return counts
 
 
+async def cached_row_gauges(ttl_seconds: float = 2.0) -> dict[str, int]:
+    global row_gauge_cache
+    now = time.monotonic()
+    cached_at, counts = row_gauge_cache
+    if counts and now - cached_at < ttl_seconds:
+        return dict(counts)
+    counts = await refresh_row_gauges()
+    row_gauge_cache = (now, dict(counts))
+    return counts
+
+
 async def set_scenario(name: str, enabled: bool) -> None:
     scenario_state[name] = enabled
     SCENARIO_ON.labels(SERVICE_NAME, name).set(1 if enabled else 0)
@@ -252,6 +275,45 @@ async def set_scenario(name: str, enabled: bool) -> None:
         "scenario.changed",
         json_arg({"name": name, "enabled": enabled, "service": SERVICE_NAME, "at": utc_now()}),
     )
+
+
+def decode_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        return json.loads(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
+async def save_traffic_runtime(payload: dict[str, Any]) -> None:
+    generation = int(payload.get("generation") or 0)
+    await exec_db(
+        "traffic_runtime",
+        """
+        INSERT INTO traffic_runtime(key, payload, updated_at)
+        VALUES('traffic', $1::jsonb, now())
+        ON CONFLICT (key)
+        DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()
+        WHERE COALESCE((traffic_runtime.payload->>'generation')::bigint, 0) <= $2
+        """,
+        json_arg(payload),
+        generation,
+    )
+
+
+async def load_traffic_runtime() -> dict[str, Any]:
+    rows = await timed_db("traffic_runtime", "SELECT payload FROM traffic_runtime WHERE key = 'traffic'")
+    return decode_payload(rows[0]["payload"]) if rows else {}
+
+
+async def sync_traffic_runtime() -> dict[str, Any]:
+    runtime = await load_traffic_runtime()
+    if not runtime:
+        return {}
+    async with traffic_lock:
+        if int(runtime.get("generation") or 0) >= int(traffic_state.get("generation") or 0):
+            traffic_state.update(runtime)
+        return dict(traffic_state)
 
 
 async def sync_scenarios_from_db(force: bool = False) -> dict[str, bool]:
@@ -452,24 +514,41 @@ async def cluster_snapshot() -> dict[str, Any]:
         return {**base, "error": str(exc)}
 
 
+async def cached_cluster_snapshot(ttl_seconds: float = 0.45) -> dict[str, Any]:
+    global cluster_cache
+    now = time.monotonic()
+    cached_at, cluster = cluster_cache
+    if cluster and now - cached_at < ttl_seconds:
+        return dict(cluster)
+    cluster = await cluster_snapshot()
+    cluster_cache = (now, dict(cluster))
+    return cluster
+
+
 async def scale_api_deployment(replicas: int) -> dict[str, Any]:
+    global cluster_cache
     if not kube_available():
         raise RuntimeError("Kubernetes service account is not available")
-    return await kube_json(
+    scale = await kube_json(
         "PATCH",
         f"/apis/apps/v1/namespaces/{KUBE_NAMESPACE}/deployments/{DEPLOYMENT_NAME}/scale",
         {"spec": {"replicas": replicas}},
     )
+    cluster_cache = (0.0, {})
+    return scale
 
 
 async def patch_hpa_bounds(min_replicas: int, max_replicas: int) -> dict[str, Any] | None:
+    global cluster_cache
     if not kube_available():
         raise RuntimeError("Kubernetes service account is not available")
-    return await kube_json(
+    hpa = await kube_json(
         "PATCH",
         f"/apis/autoscaling/v2/namespaces/{KUBE_NAMESPACE}/horizontalpodautoscalers/{DEPLOYMENT_NAME}",
         {"spec": {"minReplicas": min_replicas, "maxReplicas": max_replicas}},
     )
+    cluster_cache = (0.0, {})
+    return hpa
 
 
 async def patch_release(version: str, flavor: str) -> dict[str, Any]:
@@ -543,7 +622,7 @@ async def apply_receiver_replicas(target_tps: int, mode: str, manual_replicas: i
 
 
 async def traffic_cluster_refresh() -> None:
-    cluster = await cluster_snapshot()
+    cluster = await cached_cluster_snapshot()
     async with traffic_lock:
         traffic_state["ready_replicas"] = max(1, int(cluster.get("ready_replicas") or cluster.get("desired_replicas") or BASE_REPLICAS))
         traffic_state["desired_replicas"] = max(1, int(cluster.get("desired_replicas") or traffic_state["ready_replicas"]))
@@ -618,6 +697,11 @@ async def receiver_loop() -> None:
 
 
 async def traffic_snapshot(cluster: dict[str, Any]) -> dict[str, Any]:
+    runtime = await load_traffic_runtime()
+    if runtime:
+        async with traffic_lock:
+            if int(runtime.get("generation") or 0) >= int(traffic_state.get("generation") or 0):
+                traffic_state.update(runtime)
     ready = max(1, int(cluster.get("ready_replicas") or cluster.get("desired_replicas") or BASE_REPLICAS))
     desired = max(1, int(cluster.get("desired_replicas") or ready))
     traffic_state["ready_replicas"] = ready
@@ -814,7 +898,7 @@ async def metrics() -> Response:
 async def status(response: Response) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     scenarios = await sync_scenarios_from_db(force=True)
-    counts, cluster = await asyncio.gather(refresh_row_gauges(), cluster_snapshot())
+    counts, cluster = await asyncio.gather(cached_row_gauges(), cached_cluster_snapshot())
     traffic = await traffic_snapshot(cluster)
     samples = list(latency_samples)
     p95 = sorted(samples)[int(len(samples) * 0.95) - 1] if samples else 0
@@ -1004,6 +1088,7 @@ async def start_receiver(request: Request) -> dict[str, Any]:
     source = str(payload.get("source", "")).lower()
     run_id = str(payload.get("run_id") or f"{SERVICE_NAME}-{time.time_ns()}")
     if source == "sender":
+        await sync_traffic_runtime()
         async with traffic_lock:
             mode = str(traffic_state.get("mode") or "manual")
             manual_replicas = int(traffic_state.get("manual_replicas") or BASE_REPLICAS)
@@ -1033,6 +1118,7 @@ async def start_receiver(request: Request) -> dict[str, Any]:
             "mode": mode,
             "target_tps": target_tps,
             "manual_replicas": manual_replicas,
+            "desired_replicas": int(scale["target_replicas"]),
             "queue_depth": 0.0,
             "received_total": 0,
             "processed_total": 0,
@@ -1040,6 +1126,8 @@ async def start_receiver(request: Request) -> dict[str, Any]:
             "last_tick": time.monotonic(),
             "updated_at": utc_now(),
         })
+        runtime_payload = dict(traffic_state)
+    await save_traffic_runtime(runtime_payload)
     await set_scenario("traffic_link", True)
     await set_scenario("scale_surge", mode == "auto")
     if receiver_task is None or receiver_task.done():
@@ -1073,11 +1161,14 @@ async def scale_receiver(request: Request) -> dict[str, Any]:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     async with traffic_lock:
+        traffic_state["generation"] = time.time_ns()
         traffic_state["mode"] = mode
         traffic_state["target_tps"] = target_tps
         traffic_state["manual_replicas"] = manual_replicas
         traffic_state["desired_replicas"] = int(scale["target_replicas"])
         traffic_state["updated_at"] = utc_now()
+        runtime_payload = dict(traffic_state)
+    await save_traffic_runtime(runtime_payload)
     await set_scenario("scale_surge", mode == "auto")
     return {"status": "scaled", "mode": mode, "target_tps": target_tps, **scale}
 
@@ -1090,6 +1181,7 @@ async def stop_receiver(request: Request) -> dict[str, Any]:
     except Exception:
         payload = {}
     stop_run_id = str(payload.get("run_id") or "")
+    await sync_traffic_runtime()
     async with traffic_lock:
         current_run_id = str(traffic_state.get("run_id") or "")
         if stop_run_id and current_run_id and stop_run_id != current_run_id:
@@ -1105,17 +1197,27 @@ async def stop_receiver(request: Request) -> dict[str, Any]:
             "generation": generation,
             "target_tps": 0,
             "queue_depth": 0.0,
+            "received_per_second": 0,
+            "processed_per_second": 0,
+            "desired_replicas": BASE_REPLICAS,
             "updated_at": utc_now(),
         })
-    cluster = await cluster_snapshot()
+        runtime_payload = dict(traffic_state)
+    await save_traffic_runtime(runtime_payload)
     await set_scenario("traffic_link", False)
     await set_scenario("scale_surge", False)
     await set_scenario("load", False)
+    try:
+        await patch_hpa_bounds(BASE_REPLICAS, BASE_REPLICAS)
+        scale = await scale_api_deployment(BASE_REPLICAS)
+    except RuntimeError:
+        cluster = await cluster_snapshot()
+        scale = {"spec": {"replicas": int(cluster.get("desired_replicas") or BASE_REPLICAS)}}
     return {
         "scenario": "traffic_link",
         "status": "receiver_stopped",
-        "target_replicas": int(cluster.get("desired_replicas") or BASE_REPLICAS),
-        "observed_replicas": int(cluster.get("desired_replicas") or BASE_REPLICAS),
+        "target_replicas": BASE_REPLICAS,
+        "observed_replicas": int(scale.get("spec", {}).get("replicas") or BASE_REPLICAS),
     }
 
 
@@ -1130,14 +1232,19 @@ async def receive_traffic(request: Request) -> dict[str, Any]:
     units = clamp_int(payload.get("units"), 1, 1, 1000)
     target_tps = positive_int(payload.get("target_tps"), int(traffic_state.get("target_tps") or 1000))
     sender = str(payload.get("sender", "unknown"))[:80]
+    await sync_traffic_runtime()
     should_start_loop = False
+    runtime_payload: dict[str, Any] | None = None
     async with traffic_lock:
         if not traffic_state["running"]:
             traffic_state.update({
                 "running": True,
+                "generation": time.time_ns(),
                 "target_tps": target_tps,
                 "last_tick": time.monotonic(),
             })
+            should_start_loop = True
+        elif receiver_task is None or receiver_task.done():
             should_start_loop = True
         ready = max(1, int(traffic_state["ready_replicas"]))
         queue_limit = RECEIVER_CAPACITY_PER_POD * POD_PROCESS_FACTOR * 6
@@ -1153,7 +1260,11 @@ async def receive_traffic(request: Request) -> dict[str, Any]:
         queue_depth = round(float(traffic_state["queue_depth"]))
         processed_total = int(traffic_state["processed_total"])
         desired = int(traffic_state["desired_replicas"])
+        if should_start_loop:
+            runtime_payload = dict(traffic_state)
     if should_start_loop:
+        if runtime_payload is not None:
+            await save_traffic_runtime(runtime_payload)
         await set_scenario("traffic_link", True)
         if receiver_task is None or receiver_task.done():
             receiver_task = asyncio.create_task(receiver_loop())

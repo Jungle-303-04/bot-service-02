@@ -27,6 +27,13 @@ interface Status {
   traffic: Traffic;
 }
 
+interface ScaleResponse {
+  mode: 'manual' | 'auto';
+  target_tps: number;
+  target_replicas: number;
+  observed_replicas?: number;
+}
+
 interface PodBox {
   name: string;
   ready: boolean;
@@ -208,6 +215,9 @@ export default function App() {
   const busyRef = useRef(false);
   const podDraftDirtyRef = useRef(false);
   const modeDraftDirtyRef = useRef(false);
+  const mountedRef = useRef(true);
+  const refreshInFlightRef = useRef(false);
+  const refreshQueuedRef = useRef(false);
 
   const setBusyState = (next: boolean) => {
     busyRef.current = next;
@@ -223,16 +233,40 @@ export default function App() {
   };
 
   const refresh = async () => {
-    const next = await api<Status>('/api/status');
-    setStatus(next);
-    if (!busyRef.current && !podDraftDirtyRef.current) setManualReplicas(next.traffic.manual_replicas || next.cluster.desired_replicas || 1);
-    if (!busyRef.current && !modeDraftDirtyRef.current) setMode(next.traffic.mode ?? 'manual');
+    if (refreshInFlightRef.current) {
+      refreshQueuedRef.current = true;
+      return;
+    }
+    refreshInFlightRef.current = true;
+    try {
+      const next = await api<Status>('/api/status');
+      if (!mountedRef.current) return;
+      setStatus(next);
+      if (!busyRef.current && !podDraftDirtyRef.current) setManualReplicas(next.traffic.manual_replicas || next.cluster.desired_replicas || 1);
+      if (!busyRef.current && !modeDraftDirtyRef.current) setMode(next.traffic.mode ?? 'manual');
+    } finally {
+      refreshInFlightRef.current = false;
+      if (refreshQueuedRef.current && mountedRef.current) {
+        refreshQueuedRef.current = false;
+        void refresh().catch(() => undefined);
+      }
+    }
   };
 
   useEffect(() => {
-    void refresh();
-    const id = window.setInterval(() => { void refresh().catch(() => undefined); }, 250);
-    return () => window.clearInterval(id);
+    mountedRef.current = true;
+    let timer = 0;
+    let cancelled = false;
+    const loop = async () => {
+      await refresh().catch(() => undefined);
+      if (!cancelled) timer = window.setTimeout(loop, 320);
+    };
+    void loop();
+    return () => {
+      cancelled = true;
+      mountedRef.current = false;
+      window.clearTimeout(timer);
+    };
   }, []);
 
   const traffic = status?.traffic;
@@ -278,13 +312,31 @@ export default function App() {
   const applyPods = async () => {
     setBusyState(true);
     try {
-      await api('/api/traffic/receiver/scale', {
+      const result = await api<ScaleResponse>('/api/traffic/receiver/scale', {
         method: 'POST',
         body: JSON.stringify({ mode, manual_replicas: manualReplicas }),
       });
+      const appliedMode = result.mode === 'auto' ? 'auto' : 'manual';
+      const targetReplicas = positiveNumber(result.target_replicas, manualReplicas);
+      setMode(appliedMode);
       setPodDirty(false);
       setModeDirty(false);
-      await refresh();
+      setStatus((current) => current ? {
+        ...current,
+        cluster: {
+          ...current.cluster,
+          desired_replicas: targetReplicas,
+          ready_replicas: Math.min(current.cluster.ready_replicas, targetReplicas),
+        },
+        traffic: {
+          ...current.traffic,
+          mode: appliedMode,
+          target_tps: result.target_tps,
+          manual_replicas: manualReplicas,
+          running: current.traffic.running,
+        },
+      } : current);
+      void refresh().catch(() => undefined);
     } finally {
       setBusyState(false);
     }
