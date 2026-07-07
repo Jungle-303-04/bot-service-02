@@ -94,37 +94,58 @@ function splitBoxes(items: Array<Omit<PodBox, 'x' | 'y' | 'w' | 'h'>>, x = 0, y 
   ];
 }
 
-function heatClass(pressure: number, ready: boolean) {
-  if (!ready) return 'idle';
-  if (pressure >= 0.72) return 'bad';
-  if (pressure >= 0.35) return 'warn';
-  return 'good';
+function moveToward(current: number, target: number, maxStep: number) {
+  const delta = target - current;
+  if (Math.abs(delta) <= maxStep) return target;
+  return current + Math.sign(delta) * maxStep;
 }
 
-function tileStyle(box: PodBox) {
+function mixColor(from: [number, number, number], to: [number, number, number], amount: number) {
+  return from.map((value, index) => Math.round(value + (to[index] - value) * amount)) as [number, number, number];
+}
+
+function tileBackground(pressure: number, ready: boolean) {
+  if (!ready) return 'rgba(237, 240, 242, 0.82)';
+  const p = Math.max(0, Math.min(1, pressure));
+  const low: [number, number, number] = [134, 183, 164];
+  const mid: [number, number, number] = [200, 183, 143];
+  const high: [number, number, number] = [189, 117, 131];
+  const color = p < 0.5 ? mixColor(low, mid, p / 0.5) : mixColor(mid, high, (p - 0.5) / 0.5);
+  return `rgba(${color[0]}, ${color[1]}, ${color[2]}, ${(0.58 + p * 0.3).toFixed(2)})`;
+}
+
+function tileStyle(box: PodBox, pressure: number) {
   return {
     left: `${box.x * 100}%`,
     top: `${box.y * 100}%`,
     width: `${box.w * 100}%`,
     height: `${box.h * 100}%`,
+    backgroundColor: tileBackground(pressure, box.ready),
   } as CSSProperties;
 }
 
-function useSmoothNumber(target: number) {
+function useSmoothNumber(target: number, unitsPerSecond: number) {
+  const targetRef = useRef(target);
   const [value, setValue] = useState(target);
 
   useEffect(() => {
+    targetRef.current = target;
+  }, [target]);
+
+  useEffect(() => {
     let frame = 0;
-    const tick = () => {
+    let previous = performance.now();
+    const tick = (now: number) => {
+      const elapsed = Math.min(0.05, Math.max(0, (now - previous) / 1000));
+      previous = now;
       setValue((current) => {
-        const next = current + (target - current) * 0.22;
-        return Math.abs(next - target) < 0.5 ? target : next;
+        return moveToward(current, targetRef.current, unitsPerSecond * elapsed);
       });
       frame = window.requestAnimationFrame(tick);
     };
     frame = window.requestAnimationFrame(tick);
     return () => window.cancelAnimationFrame(frame);
-  }, [target]);
+  }, [unitsPerSecond]);
 
   return value;
 }
@@ -139,7 +160,10 @@ function useSmoothPods(targets: Array<Omit<PodBox, 'x' | 'y' | 'w' | 'h'>>) {
 
   useEffect(() => {
     let frame = 0;
-    const tick = () => {
+    let previous = performance.now();
+    const tick = (now: number) => {
+      const elapsed = Math.min(0.05, Math.max(0, (now - previous) / 1000));
+      previous = now;
       setValue((current) => {
         const currentByName = new Map(current.map((item) => [item.name, item]));
         return targetsRef.current.map((target) => {
@@ -149,9 +173,9 @@ function useSmoothPods(targets: Array<Omit<PodBox, 'x' | 'y' | 'w' | 'h'>>) {
           }
           return {
             ...target,
-            rate: currentItem.rate + (target.rate - currentItem.rate) * 0.18,
-            queue: currentItem.queue + (target.queue - currentItem.queue) * 0.16,
-            weight: currentItem.weight + (target.weight - currentItem.weight) * 0.14,
+            rate: moveToward(currentItem.rate, target.rate, 12000 * elapsed),
+            queue: moveToward(currentItem.queue, target.queue, 120000 * elapsed),
+            weight: moveToward(currentItem.weight, target.weight, 36 * elapsed),
           };
         });
       });
@@ -186,8 +210,8 @@ export default function App() {
   const ready = cluster?.ready_replicas ?? 0;
   const desired = cluster?.desired_replicas ?? 1;
   const pressure = traffic?.pressure ?? 0;
-  const smoothTps = useSmoothNumber(traffic?.processed_per_second ?? 0);
-  const smoothQueue = useSmoothNumber(traffic?.queue_depth ?? 0);
+  const smoothTps = useSmoothNumber(traffic?.processed_per_second ?? 0, 36000);
+  const smoothQueue = useSmoothNumber(traffic?.queue_depth ?? 0, 120000);
 
   const rawPods = useMemo(() => {
     const actual = [...(cluster?.pods ?? [])].sort((left, right) => {
@@ -259,7 +283,7 @@ export default function App() {
             const podPressure = box.queue ? Math.min(1, box.queue / 2400) : 0;
             const compact = box.w < 0.07 || box.h < 0.08 || box.w * box.h < 0.012;
             return (
-              <article key={box.name} className={`tile ${heatClass(podPressure, box.ready)} ${compact ? 'compact' : ''}`} style={tileStyle(box)} title={`${box.name} ${formatTileRate(box.rate)} ${formatTileQueue(box.queue)}`}>
+              <article key={box.name} className={`tile ${compact ? 'compact' : ''}`} style={tileStyle(box, podPressure)} title={`${box.name} ${formatTileRate(box.rate)} ${formatTileQueue(box.queue)}`}>
                 <b>{String(index + 1).padStart(2, '0')}</b>
                 <strong>{formatTileRate(box.rate)}</strong>
                 <span>{formatTileQueue(box.queue)}</span>

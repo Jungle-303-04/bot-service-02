@@ -83,7 +83,7 @@ h1 {
 .control-panel > button.primary {
   color: #ffffff;
   border-color: transparent;
-  background: linear-gradient(135deg, #5fae75, #63bf99);
+  background: rgba(95, 174, 117, .86);
 }
 
 button:disabled {
@@ -173,14 +173,9 @@ input {
   padding: 8px;
   border: 1px solid rgba(255, 255, 255, .92);
   color: #334050;
-  transition: background .16s linear, color .16s linear;
+  transition: color .12s linear;
   will-change: left, top, width, height, background;
 }
-
-.tile.good { background: linear-gradient(135deg, #a9cfbe 0%, var(--good) 100%); }
-.tile.warn { background: linear-gradient(135deg, #dfd0aa 0%, var(--warn) 100%); }
-.tile.bad { background: linear-gradient(135deg, #d39ca7 0%, var(--bad) 100%); }
-.tile.idle { background: linear-gradient(135deg, #f4f6f7 0%, var(--idle) 100%); color: #7b8591; }
 
 .tile b,
 .tile strong,
