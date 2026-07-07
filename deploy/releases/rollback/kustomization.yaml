@@ -1,0 +1,15 @@
+resources:
+  - ../../k8s/base
+
+patches:
+  - target:
+      kind: Deployment
+      name: bot-service-02-api
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/env/3/value
+        value: v1.0.1-rollback
+      - op: replace
+        path: /spec/template/spec/containers/0/env/4/value
+        value: stable
+

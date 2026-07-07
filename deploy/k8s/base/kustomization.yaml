@@ -1,0 +1,6 @@
+resources:
+  - postgres.yaml
+  - api.yaml
+  - web.yaml
+  - hpa.yaml
+
