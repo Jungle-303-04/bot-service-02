@@ -620,6 +620,16 @@ async def traffic_snapshot(cluster: dict[str, Any]) -> dict[str, Any]:
     desired = max(1, int(cluster.get("desired_replicas") or ready))
     traffic_state["ready_replicas"] = ready
     traffic_state["desired_replicas"] = desired
+    if not traffic_state["running"]:
+        return {
+            **traffic_state,
+            "queue_depth": 0,
+            "received_per_second": 0,
+            "processed_per_second": 0,
+            "pressure": 0,
+            "capacity_per_second": ready * RECEIVER_CAPACITY_PER_POD,
+            "pod_stats": {},
+        }
     pod_rows = await timed_db(
         "traffic_receiver_pods",
         """
@@ -991,13 +1001,21 @@ async def start_receiver(request: Request) -> dict[str, Any]:
     target_tps, mode, manual_replicas = parse_traffic_payload(payload)
     source = str(payload.get("source", "")).lower()
     if source == "sender":
-        cluster = await cluster_snapshot()
-        scale = {
-            "target_replicas": int(cluster.get("desired_replicas") or BASE_REPLICAS),
-            "hpa_max_replicas": int(cluster.get("hpa", {}).get("max_replicas") or HPA_MAX_REPLICAS),
-            "observed_replicas": int(cluster.get("desired_replicas") or BASE_REPLICAS),
-        }
-        manual_replicas = int(scale["target_replicas"])
+        async with traffic_lock:
+            mode = str(traffic_state.get("mode") or "manual")
+            manual_replicas = int(traffic_state.get("manual_replicas") or BASE_REPLICAS)
+        if mode == "auto":
+            try:
+                scale = await apply_receiver_replicas(target_tps, mode, manual_replicas)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+        else:
+            cluster = await cluster_snapshot()
+            scale = {
+                "target_replicas": int(cluster.get("desired_replicas") or BASE_REPLICAS),
+                "hpa_max_replicas": int(cluster.get("hpa", {}).get("max_replicas") or HPA_MAX_REPLICAS),
+                "observed_replicas": int(cluster.get("desired_replicas") or BASE_REPLICAS),
+            }
     else:
         try:
             scale = await apply_receiver_replicas(target_tps, mode, manual_replicas)
@@ -1039,16 +1057,23 @@ async def scale_receiver(request: Request) -> dict[str, Any]:
         payload = await request.json()
     except Exception:
         payload = {}
+    mode = str(payload.get("mode", "manual")).lower()
+    if mode not in {"manual", "auto"}:
+        mode = "manual"
     manual_replicas = positive_int(payload.get("manual_replicas"), BASE_REPLICAS)
+    target_tps = positive_int(payload.get("target_tps"), int(traffic_state.get("target_tps") or 1))
     try:
-        scale = await apply_receiver_replicas(1, "manual", manual_replicas)
+        scale = await apply_receiver_replicas(target_tps, mode, manual_replicas)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     async with traffic_lock:
+        traffic_state["mode"] = mode
+        traffic_state["target_tps"] = target_tps
         traffic_state["manual_replicas"] = manual_replicas
-        traffic_state["desired_replicas"] = manual_replicas
+        traffic_state["desired_replicas"] = int(scale["target_replicas"])
         traffic_state["updated_at"] = utc_now()
-    return {"status": "scaled", **scale}
+    await set_scenario("scale_surge", mode == "auto")
+    return {"status": "scaled", "mode": mode, "target_tps": target_tps, **scale}
 
 
 @app.post("/api/traffic/receiver/stop")

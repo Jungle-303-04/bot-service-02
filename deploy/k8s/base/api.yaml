@@ -71,7 +71,7 @@ spec:
             - name: BASE_REPLICAS
               value: "1"
             - name: HPA_MAX_REPLICAS
-              value: "10"
+              value: "100"
             - name: RECEIVER_CAPACITY_PER_POD
               value: "1200"
             - name: SURGE_REPLICAS
@@ -91,8 +91,8 @@ spec:
             periodSeconds: 20
           resources:
             requests:
-              cpu: 120m
-              memory: 180Mi
+              cpu: 10m
+              memory: 48Mi
             limits:
-              cpu: 700m
-              memory: 512Mi
+              cpu: 300m
+              memory: 256Mi

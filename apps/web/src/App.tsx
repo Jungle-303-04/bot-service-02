@@ -12,6 +12,10 @@ interface Cluster {
 }
 
 interface Traffic {
+  running: boolean;
+  mode: 'manual' | 'auto';
+  target_tps: number;
+  manual_replicas: number;
   queue_depth: number;
   processed_per_second: number;
   pressure: number;
@@ -52,8 +56,8 @@ function formatCount(value: number) {
 
 function formatTileRate(value: number) {
   const rounded = Math.round(value || 0);
-  if (rounded >= 1000) return `${(rounded / 1000).toFixed(rounded >= 10000 ? 0 : 1)}k/s`;
-  return `${rounded}/s`;
+  if (rounded >= 1000) return `${(rounded / 1000).toFixed(rounded >= 10000 ? 0 : 1)}k`;
+  return `${rounded}`;
 }
 
 function formatTileQueue(value: number) {
@@ -124,13 +128,16 @@ function tileStyle(box: PodBox, pressure: number) {
   } as CSSProperties;
 }
 
-function useSmoothNumber(target: number, unitsPerSecond: number) {
+function useSmoothNumber(target: number, unitsPerSecond: number, snap = false) {
   const targetRef = useRef(target);
+  const snapRef = useRef(snap);
   const [value, setValue] = useState(target);
 
   useEffect(() => {
     targetRef.current = target;
-  }, [target]);
+    snapRef.current = snap;
+    if (snap) setValue(target);
+  }, [target, snap]);
 
   useEffect(() => {
     let frame = 0;
@@ -139,6 +146,7 @@ function useSmoothNumber(target: number, unitsPerSecond: number) {
       const elapsed = Math.min(0.05, Math.max(0, (now - previous) / 1000));
       previous = now;
       setValue((current) => {
+        if (snapRef.current) return targetRef.current;
         return moveToward(current, targetRef.current, unitsPerSecond * elapsed);
       });
       frame = window.requestAnimationFrame(tick);
@@ -150,13 +158,16 @@ function useSmoothNumber(target: number, unitsPerSecond: number) {
   return value;
 }
 
-function useSmoothPods(targets: Array<Omit<PodBox, 'x' | 'y' | 'w' | 'h'>>) {
+function useSmoothPods(targets: Array<Omit<PodBox, 'x' | 'y' | 'w' | 'h'>>, snap = false) {
   const targetsRef = useRef(targets);
+  const snapRef = useRef(snap);
   const [value, setValue] = useState(targets);
 
   useEffect(() => {
     targetsRef.current = targets;
-  }, [targets]);
+    snapRef.current = snap;
+    if (snap) setValue(targets);
+  }, [targets, snap]);
 
   useEffect(() => {
     let frame = 0;
@@ -165,6 +176,7 @@ function useSmoothPods(targets: Array<Omit<PodBox, 'x' | 'y' | 'w' | 'h'>>) {
       const elapsed = Math.min(0.05, Math.max(0, (now - previous) / 1000));
       previous = now;
       setValue((current) => {
+        if (snapRef.current) return targetsRef.current;
         const currentByName = new Map(current.map((item) => [item.name, item]));
         return targetsRef.current.map((target) => {
           const currentItem = currentByName.get(target.name);
@@ -191,12 +203,30 @@ function useSmoothPods(targets: Array<Omit<PodBox, 'x' | 'y' | 'w' | 'h'>>) {
 export default function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [manualReplicas, setManualReplicas] = useState(1);
+  const [mode, setMode] = useState<'manual' | 'auto'>('manual');
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const podDraftDirtyRef = useRef(false);
+  const modeDraftDirtyRef = useRef(false);
+
+  const setBusyState = (next: boolean) => {
+    busyRef.current = next;
+    setBusy(next);
+  };
+
+  const setPodDirty = (next: boolean) => {
+    podDraftDirtyRef.current = next;
+  };
+
+  const setModeDirty = (next: boolean) => {
+    modeDraftDirtyRef.current = next;
+  };
 
   const refresh = async () => {
     const next = await api<Status>('/api/status');
     setStatus(next);
-    if (!busy) setManualReplicas(next.cluster.desired_replicas || 1);
+    if (!busyRef.current && !podDraftDirtyRef.current) setManualReplicas(next.traffic.manual_replicas || next.cluster.desired_replicas || 1);
+    if (!busyRef.current && !modeDraftDirtyRef.current) setMode(next.traffic.mode ?? 'manual');
   };
 
   useEffect(() => {
@@ -210,8 +240,9 @@ export default function App() {
   const ready = cluster?.ready_replicas ?? 0;
   const desired = cluster?.desired_replicas ?? 1;
   const pressure = traffic?.pressure ?? 0;
-  const smoothTps = useSmoothNumber(traffic?.processed_per_second ?? 0, 36000);
-  const smoothQueue = useSmoothNumber(traffic?.queue_depth ?? 0, 120000);
+  const snapStopped = !traffic?.running;
+  const smoothTps = useSmoothNumber(traffic?.processed_per_second ?? 0, 36000, snapStopped);
+  const smoothQueue = useSmoothNumber(traffic?.queue_depth ?? 0, 120000, snapStopped);
 
   const rawPods = useMemo(() => {
     const actual = [...(cluster?.pods ?? [])].sort((left, right) => {
@@ -241,19 +272,21 @@ export default function App() {
     });
   }, [cluster, traffic?.pod_stats]);
 
-  const pods = useSmoothPods(rawPods);
+  const pods = useSmoothPods(rawPods, snapStopped);
   const boxes = useMemo(() => splitBoxes(pods), [pods]);
 
   const applyPods = async () => {
-    setBusy(true);
+    setBusyState(true);
     try {
       await api('/api/traffic/receiver/scale', {
         method: 'POST',
-        body: JSON.stringify({ manual_replicas: manualReplicas }),
+        body: JSON.stringify({ mode, manual_replicas: manualReplicas }),
       });
+      setPodDirty(false);
+      setModeDirty(false);
       await refresh();
     } finally {
-      setBusy(false);
+      setBusyState(false);
     }
   };
 
@@ -264,15 +297,19 @@ export default function App() {
       </section>
 
       <section className="control-panel receiver">
+        <div className="segmented">
+          <button className={mode === 'manual' ? 'active' : ''} onClick={() => { setMode('manual'); setModeDirty(true); }} disabled={busy}>수동</button>
+          <button className={mode === 'auto' ? 'active' : ''} onClick={() => { setMode('auto'); setModeDirty(true); }} disabled={busy}>자동</button>
+        </div>
         <label>
           <span>Pod</span>
-          <input type="number" min={1} value={manualReplicas} onChange={(event) => setManualReplicas(positiveNumber(Number(event.target.value), 1))} />
+          <input type="number" min={1} value={manualReplicas} onFocus={() => setPodDirty(true)} onChange={(event) => { setPodDirty(true); setManualReplicas(positiveNumber(Number(event.target.value), 1)); }} disabled={busy || mode === 'auto'} />
         </label>
         <button className="primary" onClick={applyPods} disabled={busy}>적용</button>
       </section>
 
       <section className="metrics">
-        <Metric label="TPS" value={`${formatCount(smoothTps)}/s`} />
+        <Metric label="TPS" value={formatCount(smoothTps)} />
         <Metric label="대기" value={formatCount(smoothQueue)} tone={pressure > 0.72 ? 'bad' : pressure > 0.35 ? 'warn' : 'ok'} />
         <Metric label="Pod" value={`${ready} / ${desired}`} />
       </section>

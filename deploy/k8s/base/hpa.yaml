@@ -9,7 +9,7 @@ spec:
     kind: Deployment
     name: bot-service-02-api
   minReplicas: 1
-  maxReplicas: 1
+  maxReplicas: 100
   metrics:
     - type: Resource
       resource:

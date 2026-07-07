@@ -67,7 +67,32 @@ h1 {
 }
 
 .control-panel.receiver {
-  grid-template-columns: minmax(140px, 1fr) 132px;
+  grid-template-columns: 132px minmax(140px, 1fr) 132px;
+}
+
+.segmented {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  min-height: 42px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #f7f8f9;
+}
+
+.segmented button {
+  min-height: 36px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #6e7886;
+  cursor: pointer;
+  font-weight: 850;
+}
+
+.segmented button.active {
+  color: #ffffff;
+  background: #30363f;
 }
 
 .control-panel > button {
@@ -86,7 +111,8 @@ h1 {
   background: rgba(95, 174, 117, .86);
 }
 
-button:disabled {
+button:disabled,
+input:disabled {
   cursor: not-allowed;
   opacity: .5;
 }
