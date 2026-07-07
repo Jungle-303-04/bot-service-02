@@ -109,6 +109,7 @@ export default function App() {
       const next = await api<Status>('/api/status');
       statusRef.current = next;
       setStatus(next);
+      setNotice((current) => (current === '상태 조회 재시도 중' ? (runningRef.current ? '트래픽 실행 중' : '대기 중') : current));
     } catch {
       setNotice('상태 조회 재시도 중');
     }
