@@ -189,7 +189,10 @@ export default function App() {
   const smoothQueue = useSmoothNumber(traffic?.queue_depth ?? 0);
 
   const rawPods = useMemo(() => {
-    const actual = cluster?.pods ?? [];
+    const actual = [...(cluster?.pods ?? [])].sort((left, right) => {
+      if (left.ready !== right.ready) return left.ready ? -1 : 1;
+      return left.name.localeCompare(right.name);
+    });
     const stats = traffic?.pod_stats ?? {};
     const actualRates = actual.map((pod) => stats[pod.name]?.processed_per_second ?? 0);
     const activeAverage = Math.max(1, actualRates.reduce((sum, rate) => sum + rate, 0) / Math.max(1, actualRates.filter((rate) => rate > 0).length));
