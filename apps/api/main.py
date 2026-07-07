@@ -73,6 +73,8 @@ receiver_task: asyncio.Task[Any] | None = None
 traffic_state: dict[str, Any] = {
     "role": "receiver",
     "running": False,
+    "generation": 0,
+    "run_id": "",
     "mode": "manual",
     "target_tps": 0,
     "manual_replicas": BASE_REPLICAS,
@@ -1000,6 +1002,7 @@ async def start_receiver(request: Request) -> dict[str, Any]:
         payload = {}
     target_tps, mode, manual_replicas = parse_traffic_payload(payload)
     source = str(payload.get("source", "")).lower()
+    run_id = str(payload.get("run_id") or f"{SERVICE_NAME}-{time.time_ns()}")
     if source == "sender":
         async with traffic_lock:
             mode = str(traffic_state.get("mode") or "manual")
@@ -1022,8 +1025,11 @@ async def start_receiver(request: Request) -> dict[str, Any]:
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
     async with traffic_lock:
+        generation = int(traffic_state.get("generation") or 0) + 1
         traffic_state.update({
             "running": True,
+            "generation": generation,
+            "run_id": run_id,
             "mode": mode,
             "target_tps": target_tps,
             "manual_replicas": manual_replicas,
@@ -1077,10 +1083,26 @@ async def scale_receiver(request: Request) -> dict[str, Any]:
 
 
 @app.post("/api/traffic/receiver/stop")
-async def stop_receiver() -> dict[str, Any]:
+async def stop_receiver(request: Request) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    stop_run_id = str(payload.get("run_id") or "")
     async with traffic_lock:
+        current_run_id = str(traffic_state.get("run_id") or "")
+        if stop_run_id and current_run_id and stop_run_id != current_run_id:
+            return {
+                "scenario": "traffic_link",
+                "status": "stale_stop_ignored",
+                "target_replicas": int(traffic_state.get("desired_replicas") or BASE_REPLICAS),
+                "observed_replicas": int(traffic_state.get("desired_replicas") or BASE_REPLICAS),
+            }
+        generation = int(traffic_state.get("generation") or 0) + 1
         traffic_state.update({
             "running": False,
+            "generation": generation,
             "target_tps": 0,
             "queue_depth": 0.0,
             "updated_at": utc_now(),
