@@ -246,7 +246,12 @@ def kube_available() -> bool:
     return bool(os.getenv("KUBERNETES_SERVICE_HOST")) and os.path.exists(KUBE_TOKEN_PATH)
 
 
-def kube_request(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+def kube_request(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | list[dict[str, Any]] | None = None,
+    content_type: str = "application/merge-patch+json",
+) -> dict[str, Any]:
     host = os.getenv("KUBERNETES_SERVICE_HOST")
     port = os.getenv("KUBERNETES_SERVICE_PORT_HTTPS", "443")
     if not host or not os.path.exists(KUBE_TOKEN_PATH):
@@ -261,7 +266,7 @@ def kube_request(method: str, path: str, payload: dict[str, Any] | None = None) 
     }
     data = None
     if payload is not None:
-        headers["content-type"] = "application/merge-patch+json"
+        headers["content-type"] = content_type
         data = json.dumps(payload).encode("utf-8")
 
     cafile = KUBE_CA_PATH if os.path.exists(KUBE_CA_PATH) else None
@@ -283,8 +288,13 @@ def kube_request(method: str, path: str, payload: dict[str, Any] | None = None) 
         raise RuntimeError(f"Kubernetes API {method} {path} is unreachable: {exc.reason}") from exc
 
 
-async def kube_json(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    return await asyncio.to_thread(kube_request, method, path, payload)
+async def kube_json(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | list[dict[str, Any]] | None = None,
+    content_type: str = "application/merge-patch+json",
+) -> dict[str, Any]:
+    return await asyncio.to_thread(kube_request, method, path, payload, content_type)
 
 
 def parse_age_seconds(timestamp: str | None) -> int:
@@ -340,6 +350,16 @@ def hpa_summary(hpa: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def container_env_value(deployment: dict[str, Any], name: str) -> str | None:
+    containers = deployment.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+    if not containers:
+        return None
+    for item in containers[0].get("env", []):
+        if item.get("name") == name:
+            return item.get("value")
+    return None
+
+
 async def cluster_snapshot() -> dict[str, Any]:
     base = {
         "available": False,
@@ -349,6 +369,11 @@ async def cluster_snapshot() -> dict[str, Any]:
         "ready_replicas": 0,
         "available_replicas": 0,
         "updated_replicas": 0,
+        "generation": 0,
+        "observed_generation": 0,
+        "template_version": "unknown",
+        "template_flavor": "unknown",
+        "rollout_complete": False,
         "pods": [],
         "hpa": {"available": False},
     }
@@ -366,6 +391,11 @@ async def cluster_snapshot() -> dict[str, Any]:
         except RuntimeError:
             hpa = None
         status = deployment.get("status", {})
+        desired = int(deployment.get("spec", {}).get("replicas") or 0)
+        updated = int(status.get("updatedReplicas") or 0)
+        available = int(status.get("availableReplicas") or 0)
+        generation = int(deployment.get("metadata", {}).get("generation") or 0)
+        observed_generation = int(status.get("observedGeneration") or 0)
         pod_items = sorted(
             (pod_summary(pod) for pod in pods.get("items", [])),
             key=lambda item: item["name"],
@@ -373,10 +403,15 @@ async def cluster_snapshot() -> dict[str, Any]:
         return {
             **base,
             "available": True,
-            "desired_replicas": int(deployment.get("spec", {}).get("replicas") or 0),
+            "desired_replicas": desired,
             "ready_replicas": int(status.get("readyReplicas") or 0),
-            "available_replicas": int(status.get("availableReplicas") or 0),
-            "updated_replicas": int(status.get("updatedReplicas") or 0),
+            "available_replicas": available,
+            "updated_replicas": updated,
+            "generation": generation,
+            "observed_generation": observed_generation,
+            "template_version": container_env_value(deployment, "APP_VERSION") or "unknown",
+            "template_flavor": container_env_value(deployment, "APP_FLAVOR") or "unknown",
+            "rollout_complete": observed_generation >= generation and updated == desired and available == desired,
             "pods": pod_items,
             "hpa": hpa_summary(hpa),
         }
@@ -402,6 +437,27 @@ async def patch_hpa_bounds(min_replicas: int, max_replicas: int) -> dict[str, An
         f"/apis/autoscaling/v2/namespaces/{KUBE_NAMESPACE}/horizontalpodautoscalers/{DEPLOYMENT_NAME}",
         {"spec": {"minReplicas": min_replicas, "maxReplicas": max_replicas}},
     )
+
+
+async def patch_release(version: str, flavor: str) -> dict[str, Any]:
+    if not kube_available():
+        raise RuntimeError("Kubernetes service account is not available")
+    patch = [
+        {"op": "replace", "path": "/spec/template/spec/containers/0/env/3/value", "value": version},
+        {"op": "replace", "path": "/spec/template/spec/containers/0/env/4/value", "value": flavor},
+        {"op": "add", "path": "/spec/template/metadata/annotations/releases.bot-service.io~1updated-at", "value": utc_now()},
+        {"op": "add", "path": "/spec/template/metadata/annotations/releases.bot-service.io~1version", "value": version},
+    ]
+    return await kube_json(
+        "PATCH",
+        f"/apis/apps/v1/namespaces/{KUBE_NAMESPACE}/deployments/{DEPLOYMENT_NAME}",
+        patch,
+        "application/json-patch+json",
+    )
+
+
+def live_release_version(label: str) -> str:
+    return f"v1.2.{int(time.time()) % 10000}-{label}"
 
 
 async def cpu_burn() -> None:
@@ -701,6 +757,78 @@ async def stop_scale_surge() -> dict[str, Any]:
         "status": "stopped",
         "to": BASE_REPLICAS,
         "observed_replicas": scale.get("spec", {}).get("replicas"),
+    }
+
+
+@app.post("/api/releases/deploy")
+async def deploy_release() -> dict[str, Any]:
+    version = live_release_version("live")
+    try:
+        deployment = await patch_release(version, "stable")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    await exec_db(
+        "release_event",
+        "INSERT INTO audit_logs(event_type, payload) VALUES($1, $2::jsonb)",
+        "release.deploy",
+        json_arg({"version": version, "flavor": "stable", "service": SERVICE_NAME, "at": utc_now()}),
+    )
+    return {
+        "status": "deploying",
+        "version": version,
+        "flavor": "stable",
+        "generation": deployment.get("metadata", {}).get("generation"),
+    }
+
+
+@app.post("/api/releases/faulty")
+async def deploy_faulty_release() -> dict[str, Any]:
+    version = live_release_version("faulty")
+    flavor = "bad-schema" if SERVICE_KIND == "checkout" else "bad-crash"
+    try:
+        deployment = await patch_release(version, flavor)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    await exec_db(
+        "release_event",
+        "INSERT INTO audit_logs(event_type, payload) VALUES($1, $2::jsonb)",
+        "release.faulty",
+        json_arg({"version": version, "flavor": flavor, "service": SERVICE_NAME, "at": utc_now()}),
+    )
+    return {
+        "status": "deploying",
+        "version": version,
+        "flavor": flavor,
+        "generation": deployment.get("metadata", {}).get("generation"),
+    }
+
+
+@app.post("/api/releases/rollback")
+async def rollback_release() -> dict[str, Any]:
+    version = "v1.0.1-rollback"
+    scale_error = None
+    try:
+        await patch_hpa_bounds(BASE_REPLICAS, BASE_REPLICAS)
+        await scale_api_deployment(BASE_REPLICAS)
+        deployment = await patch_release(version, "stable")
+    except RuntimeError as exc:
+        scale_error = str(exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    for name in list(scenario_state):
+        await set_scenario(name, False)
+    await exec_db(
+        "release_event",
+        "INSERT INTO audit_logs(event_type, payload) VALUES($1, $2::jsonb)",
+        "release.rollback",
+        json_arg({"version": version, "flavor": "stable", "service": SERVICE_NAME, "at": utc_now()}),
+    )
+    return {
+        "status": "rolling_back",
+        "version": version,
+        "flavor": "stable",
+        "replicas": BASE_REPLICAS,
+        "scale_error": scale_error,
+        "generation": deployment.get("metadata", {}).get("generation"),
     }
 
 
