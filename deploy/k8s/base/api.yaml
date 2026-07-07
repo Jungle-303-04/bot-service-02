@@ -72,8 +72,6 @@ spec:
               value: "1"
             - name: HPA_MAX_REPLICAS
               value: "10"
-            - name: MAX_TRAFFIC_TPS
-              value: "10000"
             - name: RECEIVER_CAPACITY_PER_POD
               value: "1200"
             - name: SURGE_REPLICAS
