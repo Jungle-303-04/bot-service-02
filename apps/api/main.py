@@ -1025,7 +1025,7 @@ async def start_receiver(request: Request) -> dict[str, Any]:
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
     async with traffic_lock:
-        generation = int(traffic_state.get("generation") or 0) + 1
+        generation = time.time_ns()
         traffic_state.update({
             "running": True,
             "generation": generation,
@@ -1099,7 +1099,7 @@ async def stop_receiver(request: Request) -> dict[str, Any]:
                 "target_replicas": int(traffic_state.get("desired_replicas") or BASE_REPLICAS),
                 "observed_replicas": int(traffic_state.get("desired_replicas") or BASE_REPLICAS),
             }
-        generation = int(traffic_state.get("generation") or 0) + 1
+        generation = time.time_ns()
         traffic_state.update({
             "running": False,
             "generation": generation,
