@@ -112,10 +112,10 @@ export default function App() {
   const updated = cluster?.updated_replicas ?? 0;
   const rolloutPct = desired ? Math.round((Math.min(updated, desired) / desired) * 100) : 0;
   const activeIncidents = status ? Object.values(status.scenarios).filter(Boolean).length : 0;
-  const releaseTone = !cluster?.rollout_complete ? 'rolling' : cluster.template_flavor !== 'stable' ? 'fault' : 'stable';
-  const rolloutLabel = !cluster?.rollout_complete ? '배포 중' : cluster.template_flavor !== 'stable' ? '장애 버전' : '정상';
   const busyBots = useMemo(() => bots.filter(bot => bot.status === 'busy').length, [bots]);
   const loadActive = Boolean(status?.scenarios.scale_surge || status?.scenarios.load || status?.scenarios.db_bulk_insert || status?.scenarios.error_spike);
+  const releaseTone = !cluster?.rollout_complete ? 'rolling' : cluster.template_flavor !== 'stable' ? 'fault' : loadActive || desired > 2 ? 'rolling' : 'stable';
+  const rolloutLabel = !cluster?.rollout_complete ? '배포 중' : cluster.template_flavor !== 'stable' ? '장애 버전' : loadActive || desired > 2 ? '부하 중' : '정상';
   const loadPressure = Math.min(1, activeIncidents * 0.18 + Math.max(desired - 2, 0) * 0.1 + (busyBots / Math.max(1, bots.length)) * 0.28 + (cluster?.template_flavor !== 'stable' ? 0.32 : 0));
   const loadTarget = loadActive ? 1000 : desired > 2 ? 360 : 96;
 
@@ -202,7 +202,7 @@ export default function App() {
 
           <div className="panel-title compact">
             <strong>장애 제어</strong>
-            <span>{activeIncidents} active</span>
+            <span>{activeIncidents}건 활성</span>
           </div>
           <div className="button-grid">
             <button onClick={() => runIncident('scale-surge/start', '부하 증가')} disabled={!!busy}>부하 증가</button>
