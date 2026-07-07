@@ -39,6 +39,8 @@ spec:
         prometheus.io/path: /metrics
         prometheus.io/port: "8000"
     spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
       containers:
         - name: api
           image: ghcr.io/jungle-303-04/bot-service-02-api:latest
@@ -83,4 +85,3 @@ spec:
             limits:
               cpu: 700m
               memory: 512Mi
-
