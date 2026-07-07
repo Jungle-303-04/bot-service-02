@@ -1,4 +1,35 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+
+interface Pod {
+  name: string;
+  phase: string;
+  ready: boolean;
+  restarts: number;
+  node: string;
+  pod_ip?: string;
+  age_seconds: number;
+}
+
+interface Cluster {
+  available: boolean;
+  namespace: string;
+  deployment: string;
+  desired_replicas: number;
+  ready_replicas: number;
+  available_replicas: number;
+  updated_replicas: number;
+  pods: Pod[];
+  hpa: {
+    available: boolean;
+    min_replicas?: number;
+    max_replicas?: number;
+    target_cpu_utilization?: number | null;
+    current_cpu_utilization?: number | null;
+    current_replicas?: number;
+    desired_replicas?: number;
+  };
+  error?: string;
+}
 
 interface Status {
   service: string;
@@ -10,18 +41,20 @@ interface Status {
   scenarios: Record<string, boolean>;
   metrics: { p95_latency_ms: number; request_samples: number; background_tasks: number };
   rows: Record<string, number>;
+  cluster: Cluster;
 }
 
 interface Bot { id: number; name: string; status: string; current_load: number; updated_at: string }
 
 const scenarios = [
-  ['load/start', 'CPU Burn', 'worker 처리 루프에 CPU 압력을 만듭니다.'],
-  ['db-bulk-insert/start', 'Queue Flood', 'job과 event row를 대량 생성합니다.'],
-  ['db-lock/start', 'DB Lock', '긴 transaction으로 병목 증거를 만듭니다.'],
-  ['db-slow-query/start', 'Slow Query', '모든 API에 지연 쿼리를 주입합니다.'],
-  ['error-spike/start', 'Error Spike', '관제 API 오류율을 높입니다.'],
-  ['crashloop/start', 'CrashLoop', '프로세스를 종료해 pod restart를 만듭니다.'],
-  ['recover', 'Recover', '런타임 장애 플래그를 해제합니다.'],
+  ['scale-surge/start', 'Scale Swarm', '2 -> 6 API pods'],
+  ['load/start', 'CPU Burn', 'worker pressure'],
+  ['db-bulk-insert/start', 'Queue Flood', 'job + event rows'],
+  ['db-lock/start', 'DB Lock', 'transaction hold'],
+  ['db-slow-query/start', 'Slow Query', 'query delay'],
+  ['error-spike/start', 'Error Spike', '5xx storm'],
+  ['crashloop/start', 'CrashLoop', 'pod restart'],
+  ['recover', 'Recover', '6 -> 2 API pods'],
 ];
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -30,11 +63,23 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json();
 }
 
+function shortPod(name: string) {
+  return name.split('-').slice(-2).join('-');
+}
+
+function age(seconds: number) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  return `${Math.floor(seconds / 3600)}h`;
+}
+
 export default function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [bots, setBots] = useState<Bot[]>([]);
   const [notice, setNotice] = useState('fleet telemetry standby');
   const [busy, setBusy] = useState('');
+  const [storming, setStorming] = useState(false);
+  const stormRef = useRef<number | null>(null);
 
   const refresh = async () => {
     const [s, b] = await Promise.all([
@@ -45,24 +90,63 @@ export default function App() {
     setBots(b.bots);
   };
 
+  const stopStorm = () => {
+    if (stormRef.current) {
+      window.clearInterval(stormRef.current);
+      stormRef.current = null;
+    }
+    setStorming(false);
+  };
+
+  const startStorm = (durationMs: number) => {
+    stopStorm();
+    setStorming(true);
+    const deadline = Date.now() + durationMs;
+    stormRef.current = window.setInterval(() => {
+      if (Date.now() > deadline) {
+        stopStorm();
+        return;
+      }
+      void Promise.allSettled([
+        api('/api/work', { method: 'POST' }),
+        api('/api/work', { method: 'POST' }),
+        api('/api/jobs/process', { method: 'POST' }),
+      ]);
+    }, 340);
+  };
+
   useEffect(() => {
     void refresh();
-    const id = window.setInterval(() => { void refresh(); }, 2200);
-    return () => window.clearInterval(id);
+    const id = window.setInterval(() => { void refresh(); }, 1700);
+    return () => {
+      window.clearInterval(id);
+      stopStorm();
+    };
   }, []);
 
+  const cluster = status?.cluster;
+  const desired = cluster?.desired_replicas ?? 2;
+  const ready = cluster?.ready_replicas ?? 0;
+  const podCount = cluster?.pods.length ?? 0;
+  const activeCount = status ? Object.values(status.scenarios).filter(Boolean).length : 0;
   const pressure = useMemo(() => {
     if (!status) return 0;
-    const active = Object.values(status.scenarios).filter(Boolean).length;
-    const jobPressure = Math.min((status.rows.jobs ?? 0) / 20000, 0.45);
-    return Math.min(1, active * 0.18 + jobPressure + Math.min(status.metrics.p95_latency_ms / 1600, 0.35));
-  }, [status]);
+    const queuePressure = Math.min((status.rows.jobs ?? 0) / 30000, 0.3);
+    const replicaPressure = Math.min(Math.max(desired - 2, 0) / 4, 0.34);
+    const latencyPressure = Math.min(status.metrics.p95_latency_ms / 1300, 0.3);
+    return Math.min(1, queuePressure + replicaPressure + latencyPressure + activeCount * 0.07 + (storming ? 0.14 : 0));
+  }, [status, desired, activeCount, storming]);
+  const slots = Math.max(6, desired, podCount);
+  const readinessPct = desired ? Math.round((ready / desired) * 100) : 0;
 
   const runScenario = async (name: string, label: string) => {
     setBusy(label);
     try {
       await api(`/api/scenarios/${name}`, { method: 'POST' });
-      setNotice(`${label} scenario dispatched`);
+      if (name === 'scale-surge/start') startStorm(65000);
+      if (name === 'load/start') startStorm(30000);
+      if (name === 'recover') stopStorm();
+      setNotice(`${label} dispatched`);
       await refresh();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'scenario failed');
@@ -75,7 +159,7 @@ export default function App() {
     setBusy('Enqueue');
     try {
       await api('/api/jobs/enqueue', { method: 'POST' });
-      setNotice('job queued into PostgreSQL');
+      setNotice('job queued');
       await refresh();
     } finally {
       setBusy('');
@@ -86,7 +170,7 @@ export default function App() {
     setBusy('Process');
     try {
       await api('/api/jobs/process', { method: 'POST' });
-      setNotice('one queued job processed');
+      setNotice('job processed');
       await refresh();
     } finally {
       setBusy('');
@@ -94,34 +178,52 @@ export default function App() {
   };
 
   return (
-    <main className="shell">
-      <section className="hero">
+    <main className="shell" style={{ ['--pressure' as string]: pressure }}>
+      <section className="mast">
         <div>
-          <p className="label">bot-service-02</p>
+          <p className="label">bot-service-02 / fleet</p>
           <h1>Fleet Swarm</h1>
-          <p className="copy">bot worker, job queue, DB 저장량, pod restart를 열감처럼 보여주는 장애 관찰용 풀스택 서비스입니다.</p>
         </div>
-        <div className="orbital" aria-hidden>
-          {Array.from({ length: 14 }, (_, i) => <span key={i} style={{ ['--i' as string]: i }} />)}
+        <div className="status-card">
+          <span>{status?.version ?? 'loading'}</span>
+          <strong>{ready}/{desired} ready</strong>
         </div>
       </section>
 
-      <section className="topology">
-        <div className="swarm" style={{ ['--pressure' as string]: pressure }}>
-          {bots.map((bot, i) => (
-            <div className="bot" key={bot.id} style={{ animationDelay: `${i * 45}ms` }}>
-              <b>{bot.name}</b>
-              <span>{bot.status}</span>
-            </div>
-          ))}
-        </div>
+      <section className="console">
+        <section className="swarm-board">
+          <div className="swarm-head">
+            <strong>Worker Heat Field</strong>
+            <span>{storming ? 'surge traffic active' : `${activeCount} active scenario`}</span>
+          </div>
+          <div className="bot-matrix">
+            {bots.map((bot, i) => (
+              <article className="bot" key={bot.id} style={{ ['--i' as string]: i }}>
+                <b>{bot.name}</b>
+                <span>{bot.status}</span>
+                <i style={{ height: `${Math.max(8, bot.current_load)}%` }} />
+              </article>
+            ))}
+          </div>
+        </section>
+
         <aside className="panel command">
           <div className="panel-title">
             <strong>Swarm Control</strong>
             <span>{notice}</span>
           </div>
+          <div className="scale-buttons">
+            <button onClick={() => runScenario('scale-surge/start', 'Scale Swarm')} disabled={!!busy}>
+              <b>Scale Swarm</b>
+              <span>2 to 6 API pods</span>
+            </button>
+            <button onClick={() => runScenario('recover', 'Recover')} disabled={!!busy}>
+              <b>Recover</b>
+              <span>6 to 2 API pods</span>
+            </button>
+          </div>
           <div className="actions">
-            {scenarios.map(([path, label, desc]) => (
+            {scenarios.slice(1, -1).map(([path, label, desc]) => (
               <button key={path} onClick={() => runScenario(path, label)} disabled={!!busy} title={desc}>
                 <span>{label}</span>
                 <small>{desc}</small>
@@ -129,10 +231,38 @@ export default function App() {
             ))}
           </div>
           <div className="duo">
-            <button onClick={enqueue} disabled={!!busy}>Job 추가</button>
-            <button onClick={process} disabled={!!busy}>Job 처리</button>
+            <button onClick={enqueue} disabled={!!busy}>Queue Job</button>
+            <button onClick={process} disabled={!!busy}>Process Job</button>
           </div>
         </aside>
+
+        <section className="panel pods">
+          <div className="panel-title">
+            <strong>API Pod Columns</strong>
+            <span>{cluster?.deployment ?? 'deployment'}</span>
+          </div>
+          <div className="replica-meter">
+            <strong>{ready}/{desired}</strong>
+            <span>ready replicas</span>
+            <i style={{ width: `${Math.min(100, readinessPct)}%` }} />
+          </div>
+          <div className="pod-columns">
+            {Array.from({ length: slots }, (_, i) => {
+              const pod = cluster?.pods[i];
+              return (
+                <article key={pod?.name ?? i} className={`pod ${pod?.ready ? 'ready' : pod ? 'pending' : 'empty'}`}>
+                  <b>{pod ? shortPod(pod.name) : 'standby'}</b>
+                  <span>{pod ? `${pod.phase} · ${age(pod.age_seconds)}` : 'slot'}</span>
+                  <em>{pod ? `restart ${pod.restarts}` : 'pending'}</em>
+                </article>
+              );
+            })}
+          </div>
+          <div className="hpa">
+            <span>cpu {cluster?.hpa.current_cpu_utilization ?? 0}% / target {cluster?.hpa.target_cpu_utilization ?? 60}%</span>
+            <span>pods {podCount}</span>
+          </div>
+        </section>
       </section>
 
       <section className="metrics">
@@ -141,21 +271,6 @@ export default function App() {
         <Metric label="Telemetry" value={status?.rows.telemetry_samples ?? 0} />
         <Metric label="p95 ms" value={status?.metrics.p95_latency_ms ?? 0} />
       </section>
-
-      <section className="panel version">
-        <div>
-          <span>release</span>
-          <strong>{status?.version ?? 'loading'}</strong>
-        </div>
-        <div>
-          <span>flavor</span>
-          <strong>{status?.flavor ?? 'stable'}</strong>
-        </div>
-        <div>
-          <span>active scenarios</span>
-          <strong>{status ? Object.values(status.scenarios).filter(Boolean).length : 0}</strong>
-        </div>
-      </section>
     </main>
   );
 }
@@ -163,4 +278,3 @@ export default function App() {
 function Metric({ label, value }: { label: string; value: number }) {
   return <div className="metric"><span>{label}</span><strong>{Math.round(value).toLocaleString()}</strong></div>;
 }
-

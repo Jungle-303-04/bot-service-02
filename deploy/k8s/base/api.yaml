@@ -39,6 +39,7 @@ spec:
         prometheus.io/path: /metrics
         prometheus.io/port: "8000"
     spec:
+      serviceAccountName: bot-service-02-api
       imagePullSecrets:
         - name: ghcr-pull-secret
       containers:
@@ -65,6 +66,12 @@ spec:
                   key: database-url
             - name: SCENARIO_MAX_ROWS
               value: "12000"
+            - name: KUBE_NAMESPACE
+              value: sandbox
+            - name: BASE_REPLICAS
+              value: "2"
+            - name: SURGE_REPLICAS
+              value: "6"
           readinessProbe:
             httpGet:
               path: /ready
