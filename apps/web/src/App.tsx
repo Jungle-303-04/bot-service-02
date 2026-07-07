@@ -47,7 +47,7 @@ interface Status {
 interface Bot { id: number; name: string; status: string; current_load: number; updated_at: string }
 
 const scenarios = [
-  ['scale-surge/start', 'Scale Swarm', '2 -> 6 API pods'],
+  ['scale-surge/start', 'Scale Swarm', '2 -> 6+ API pods'],
   ['load/start', 'CPU Burn', 'worker pressure'],
   ['db-bulk-insert/start', 'Queue Flood', 'job + event rows'],
   ['db-lock/start', 'DB Lock', 'transaction hold'],
@@ -215,11 +215,11 @@ export default function App() {
           <div className="scale-buttons">
             <button onClick={() => runScenario('scale-surge/start', 'Scale Swarm')} disabled={!!busy}>
               <b>Scale Swarm</b>
-              <span>2 to 6 API pods</span>
+              <span>2 to 6+ API pods</span>
             </button>
             <button onClick={() => runScenario('recover', 'Recover')} disabled={!!busy}>
               <b>Recover</b>
-              <span>6 to 2 API pods</span>
+              <span>back to 2 API pods</span>
             </button>
           </div>
           <div className="actions">

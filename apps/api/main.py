@@ -54,6 +54,7 @@ scenario_state: dict[str, bool] = {
     "error_spike": False,
 }
 background_tasks: set[asyncio.Task[Any]] = set()
+last_scenario_sync = 0.0
 
 
 def utc_now() -> str:
@@ -151,6 +152,11 @@ async def init_schema() -> None:
               value DOUBLE PRECISION NOT NULL,
               created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
+            CREATE TABLE IF NOT EXISTS scenario_flags (
+              name TEXT PRIMARY KEY,
+              enabled BOOLEAN NOT NULL DEFAULT false,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
             """
         )
         await conn.execute(
@@ -171,6 +177,14 @@ async def init_schema() -> None:
             WHERE NOT EXISTS (SELECT 1 FROM bots);
             """
         )
+        await conn.executemany(
+            """
+            INSERT INTO scenario_flags(name, enabled)
+            VALUES($1, false)
+            ON CONFLICT (name) DO NOTHING
+            """,
+            [(name,) for name in scenario_state],
+        )
 
 
 async def refresh_row_gauges() -> dict[str, int]:
@@ -188,11 +202,38 @@ async def set_scenario(name: str, enabled: bool) -> None:
     scenario_state[name] = enabled
     SCENARIO_ON.labels(SERVICE_NAME, name).set(1 if enabled else 0)
     await exec_db(
+        "scenario_flag",
+        """
+        INSERT INTO scenario_flags(name, enabled, updated_at)
+        VALUES($1, $2, now())
+        ON CONFLICT (name)
+        DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()
+        """,
+        name,
+        enabled,
+    )
+    await exec_db(
         "scenario_event",
         "INSERT INTO audit_logs(event_type, payload) VALUES($1, $2::jsonb)",
         "scenario.changed",
         json_arg({"name": name, "enabled": enabled, "service": SERVICE_NAME, "at": utc_now()}),
     )
+
+
+async def sync_scenarios_from_db(force: bool = False) -> dict[str, bool]:
+    global last_scenario_sync
+    now = time.monotonic()
+    if not force and now - last_scenario_sync < 0.8:
+        return dict(scenario_state)
+    rows = await timed_db("scenario_flags", "SELECT name, enabled FROM scenario_flags")
+    for row in rows:
+        name = row["name"]
+        if name in scenario_state:
+            enabled = bool(row["enabled"])
+            scenario_state[name] = enabled
+            SCENARIO_ON.labels(SERVICE_NAME, name).set(1 if enabled else 0)
+    last_scenario_sync = now
+    return dict(scenario_state)
 
 
 def track(task: asyncio.Task[Any]) -> None:
@@ -430,6 +471,7 @@ async def lifespan(_: FastAPI):
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, command_timeout=20)
     await init_schema()
     await refresh_row_gauges()
+    await sync_scenarios_from_db(force=True)
     for name, enabled in scenario_state.items():
         SCENARIO_ON.labels(SERVICE_NAME, name).set(1 if enabled else 0)
     yield
@@ -454,11 +496,17 @@ async def observe_requests(request: Request, call_next):
     status = 500
     path = request.url.path
     try:
-        if scenario_state["error_spike"] and path.startswith("/api/") and random.random() < 0.35:
+        scenarios = dict(scenario_state)
+        if path.startswith("/api/"):
+            try:
+                scenarios = await sync_scenarios_from_db()
+            except Exception:
+                scenarios = dict(scenario_state)
+        if scenarios["error_spike"] and path.startswith("/api/") and random.random() < 0.35:
             ERRORS.labels(SERVICE_NAME, "error_spike").inc()
             status = 503
             return JSONResponse({"detail": "intentional fleet failure spike"}, status_code=503)
-        if scenario_state["db_slow_query"] and path.startswith("/api/"):
+        if scenarios["db_slow_query"] and path.startswith("/api/"):
             await timed_db("intentional_slow_query", "SELECT pg_sleep(0.08)")
         response = await call_next(request)
         status = response.status_code
@@ -490,6 +538,7 @@ async def metrics() -> Response:
 
 @app.get("/api/status")
 async def status() -> dict[str, Any]:
+    scenarios = await sync_scenarios_from_db(force=True)
     counts, cluster = await asyncio.gather(refresh_row_gauges(), cluster_snapshot())
     samples = list(latency_samples)
     p95 = sorted(samples)[int(len(samples) * 0.95) - 1] if samples else 0
@@ -500,7 +549,7 @@ async def status() -> dict[str, Any]:
         "version": APP_VERSION,
         "flavor": APP_FLAVOR,
         "generated_at": utc_now(),
-        "scenarios": scenario_state,
+        "scenarios": scenarios,
         "metrics": {
             "p95_latency_ms": round(p95 * 1000, 1),
             "request_samples": len(samples),
