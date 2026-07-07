@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -38,6 +39,14 @@ HPA_MAX_REPLICAS = int(os.getenv("HPA_MAX_REPLICAS", "10"))
 RECEIVER_CAPACITY_PER_POD = int(os.getenv("RECEIVER_CAPACITY_PER_POD", "1200"))
 KUBE_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 KUBE_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+
+def stable_pod_factor(seed: str, low: float, span: float) -> float:
+    bucket = int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:8], 16) % 1000
+    return low + (bucket / 999) * span
+
+
+POD_PROCESS_FACTOR = stable_pod_factor(POD_NAME, 0.82, 0.36)
 
 REQUESTS = Counter("bot_service_http_requests_total", "HTTP requests", ["service", "path", "method", "status"])
 LATENCY = Histogram("bot_service_http_request_duration_seconds", "HTTP request latency", ["service", "path"])
@@ -578,7 +587,7 @@ async def receiver_loop() -> None:
         async with traffic_lock:
             elapsed = max(0.05, now - float(traffic_state["last_tick"]))
             traffic_state["last_tick"] = now
-            process_capacity = RECEIVER_CAPACITY_PER_POD * elapsed
+            process_capacity = RECEIVER_CAPACITY_PER_POD * POD_PROCESS_FACTOR * elapsed
             processed = int(min(float(traffic_state["queue_depth"]), process_capacity))
             traffic_state["queue_depth"] = max(0.0, float(traffic_state["queue_depth"]) - processed)
             traffic_state["processed_total"] = int(traffic_state["processed_total"]) + processed
@@ -616,14 +625,14 @@ async def traffic_snapshot(cluster: dict[str, Any]) -> dict[str, Any]:
         """
         SELECT
           payload->>'pod' AS pod,
-          COALESCE(SUM((payload->>'units')::bigint) FILTER (
+          COALESCE(ROUND(SUM((payload->>'units')::bigint) FILTER (
             WHERE event_type IN ('traffic.received', 'traffic.overloaded')
-              AND created_at >= now() - interval '1 second'
-          ), 0) AS received_per_second,
-          COALESCE(SUM((payload->>'processed')::bigint) FILTER (
+              AND created_at >= now() - interval '2 seconds'
+          ) / 2.0), 0) AS received_per_second,
+          COALESCE(ROUND(SUM((payload->>'processed')::bigint) FILTER (
             WHERE event_type = 'traffic.processed'
-              AND created_at >= now() - interval '1 second'
-          ), 0) AS processed_per_second,
+              AND created_at >= now() - interval '2 seconds'
+          ) / 2.0), 0) AS processed_per_second,
           COALESCE(MAX((payload->>'queue_depth')::double precision), 0) AS queue_depth
         FROM bot_events
         WHERE event_type IN ('traffic.received', 'traffic.overloaded', 'traffic.processed')
@@ -1083,7 +1092,7 @@ async def receive_traffic(request: Request) -> dict[str, Any]:
             })
             should_start_loop = True
         ready = max(1, int(traffic_state["ready_replicas"]))
-        queue_limit = RECEIVER_CAPACITY_PER_POD * 6
+        queue_limit = RECEIVER_CAPACITY_PER_POD * POD_PROCESS_FACTOR * 6
         overflow = max(0, int(float(traffic_state["queue_depth"]) + units - queue_limit))
         failed = min(units, overflow)
         accepted = units - failed

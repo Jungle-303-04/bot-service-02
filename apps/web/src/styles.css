@@ -170,10 +170,11 @@ input {
   min-width: 4px;
   min-height: 4px;
   overflow: hidden;
-  padding: 10px;
+  padding: 8px;
   border: 1px solid rgba(255, 255, 255, .92);
   color: #334050;
-  transition: left .18s linear, top .18s linear, width .18s linear, height .18s linear, background .12s linear;
+  transition: background .16s linear, color .16s linear;
+  will-change: left, top, width, height, background;
 }
 
 .tile.good { background: linear-gradient(135deg, #a9cfbe 0%, var(--good) 100%); }
@@ -193,13 +194,13 @@ input {
 }
 
 .tile b {
-  font-size: clamp(11px, 1.1vw, 14px);
+  font-size: clamp(10px, .95vw, 13px);
   font-weight: 830;
 }
 
 .tile strong {
-  margin-top: 5px;
-  font-size: clamp(20px, 2.6vw, 34px);
+  margin-top: 4px;
+  font-size: clamp(15px, 1.9vw, 28px);
   line-height: .95;
   font-weight: 920;
 }
@@ -210,4 +211,20 @@ input {
   font-size: 12px;
   font-weight: 800;
   font-variant-numeric: tabular-nums;
+}
+
+.tile.compact {
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: 3px 4px;
+}
+
+.tile.compact b {
+  font-size: 10px;
+  line-height: 1;
+}
+
+.tile.compact strong,
+.tile.compact span {
+  display: none;
 }
