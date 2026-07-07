@@ -522,7 +522,7 @@ def target_replicas_for_mode(target_tps: int, mode: str, manual_replicas: int) -
 
 async def apply_receiver_replicas(target_tps: int, mode: str, manual_replicas: int) -> dict[str, Any]:
     target_replicas = target_replicas_for_mode(target_tps, mode, manual_replicas)
-    hpa_max = max(target_replicas, HPA_MAX_REPLICAS)
+    hpa_max = target_replicas if mode == "manual" else max(target_replicas, HPA_MAX_REPLICAS)
     await patch_hpa_bounds(target_replicas, hpa_max)
     scale = await scale_api_deployment(target_replicas)
     return {
