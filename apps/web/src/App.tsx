@@ -1,16 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 interface Pod {
   name: string;
   ready: boolean;
-  phase?: string;
 }
 
 interface Cluster {
   desired_replicas: number;
   ready_replicas: number;
   template_version: string;
-  template_flavor: string;
   rollout_complete: boolean;
   pods: Pod[];
   hpa?: {
@@ -28,18 +26,11 @@ interface Status {
 }
 
 interface WorkResult {
-  ok: boolean;
-}
-
-interface BotStat {
-  id: number;
   success: number;
   failure: number;
-  weight: number;
 }
 
-interface PodTile {
-  id: string;
+interface PodBox {
   name: string;
   ready: boolean;
   x: number;
@@ -59,320 +50,278 @@ function clamp(value: number, min: number, max: number) {
 }
 
 function formatCount(value: number) {
-  return value.toLocaleString('ko-KR');
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
-}
-
-async function postWithRetry(path: string, attempts = 8) {
-  let lastError: unknown;
-  for (let i = 0; i < attempts; i += 1) {
-    try {
-      return await api(path, { method: 'POST' });
-    } catch (error) {
-      lastError = error;
-      await sleep(350 + i * 160);
-    }
-  }
-  throw lastError;
-}
-
-function botCountForTarget(target: number) {
-  if (target >= 850) return 16;
-  if (target >= 500) return 12;
-  if (target >= 180) return 8;
-  return 4;
-}
-
-function createBots(target: number): BotStat[] {
-  return Array.from({ length: botCountForTarget(target) }, (_, index) => ({
-    id: index + 1,
-    success: 0,
-    failure: 0,
-    weight: 8 + ((index * 7) % 11),
-  }));
-}
-
-function totalTraffic(bot: BotStat) {
-  return bot.success + bot.failure;
+  return Math.round(value).toLocaleString('ko-KR');
 }
 
 function shortPodName(name: string) {
   return name.split('-').slice(-2).join('-');
 }
 
-function splitPods(pods: Array<{ id: string; name: string; ready: boolean }>, x = 0, y = 0, w = 100, h = 100): PodTile[] {
-  if (pods.length === 0) return [];
-  if (pods.length === 1) return [{ ...pods[0], x, y, w, h }];
+function splitBoxes(items: Array<{ name: string; ready: boolean }>, x = 0, y = 0, w = 1, h = 1): PodBox[] {
+  if (items.length === 0) return [];
+  if (items.length === 1) return [{ ...items[0], x, y, w, h }];
 
-  const firstCount = Math.ceil(pods.length / 2);
-  const first = pods.slice(0, firstCount);
-  const second = pods.slice(firstCount);
-  const ratio = first.length / pods.length;
+  const firstCount = Math.ceil(items.length / 2);
+  const first = items.slice(0, firstCount);
+  const second = items.slice(firstCount);
+  const ratio = first.length / items.length;
 
   if (w >= h) {
     const w1 = w * ratio;
-    return [
-      ...splitPods(first, x, y, w1, h),
-      ...splitPods(second, x + w1, y, w - w1, h),
-    ];
+    return [...splitBoxes(first, x, y, w1, h), ...splitBoxes(second, x + w1, y, w - w1, h)];
   }
 
   const h1 = h * ratio;
-  return [
-    ...splitPods(first, x, y, w, h1),
-    ...splitPods(second, x, y + h1, w, h - h1),
-  ];
+  return [...splitBoxes(first, x, y, w, h1), ...splitBoxes(second, x, y + h1, w, h - h1)];
 }
 
-function pickBotIndex(bots: BotStat[], sequence: number) {
-  const totalWeight = bots.reduce((sum, bot) => sum + bot.weight, 0);
-  let cursor = (sequence * 13) % totalWeight;
-  for (let i = 0; i < bots.length; i += 1) {
-    cursor -= bots[i].weight;
-    if (cursor < 0) return i;
+function heatColor(heat: number, pulse: number) {
+  const value = clamp(heat + pulse * 0.08, 0, 1);
+  if (value < 0.5) {
+    const r = value / 0.5;
+    return `rgb(${Math.round(99 + 150 * r)}, ${Math.round(205 + 13 * r)}, ${Math.round(170 - 61 * r)})`;
   }
-  return bots.length - 1;
+  const r = (value - 0.5) / 0.5;
+  return `rgb(${Math.round(249 - 7 * r)}, ${Math.round(218 - 98 * r)}, ${Math.round(109 + 19 * r)})`;
+}
+
+function failureRateFor(perPodTps: number) {
+  return clamp((perPodTps - 700) / 2200, 0.02, 0.58);
 }
 
 export default function App() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const statusRef = useRef<Status | null>(null);
+  const runningRef = useRef(false);
+  const targetTpsRef = useRef(1000);
+  const trafficTimer = useRef<number | null>(null);
+
   const [status, setStatus] = useState<Status | null>(null);
-  const [targetTraffic, setTargetTraffic] = useState(256);
-  const [bots, setBots] = useState<BotStat[]>(() => createBots(256));
+  const [targetTps, setTargetTps] = useState(1000);
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState('');
+  const [success, setSuccess] = useState(0);
+  const [failure, setFailure] = useState(0);
   const [notice, setNotice] = useState('대기 중');
-  const timerRef = useRef<number | null>(null);
-  const botsRef = useRef(bots);
-  const targetRef = useRef(targetTraffic);
-  const attemptedRef = useRef(0);
 
   const refresh = async () => {
     try {
-      setStatus(await api<Status>('/api/status'));
+      const next = await api<Status>('/api/status');
+      statusRef.current = next;
+      setStatus(next);
     } catch {
-      // 부하 중에는 의도된 실패 응답이 섞이므로 상태 조회 오류를 UI 오류로 노출하지 않습니다.
+      setNotice('상태 조회 재시도 중');
     }
   };
 
   useEffect(() => {
     void refresh();
-    const id = window.setInterval(() => { void refresh(); }, 1400);
+    const id = window.setInterval(() => { void refresh(); }, 1000);
     return () => window.clearInterval(id);
   }, []);
 
   useEffect(() => {
-    botsRef.current = bots;
-    attemptedRef.current = bots.reduce((sum, bot) => sum + totalTraffic(bot), 0);
-  }, [bots]);
+    runningRef.current = running;
+  }, [running]);
 
   useEffect(() => {
-    targetRef.current = targetTraffic;
-  }, [targetTraffic]);
-
-  const ready = status?.cluster.ready_replicas ?? 0;
-  const desired = status?.cluster.desired_replicas ?? 0;
-  const hpaMin = status?.cluster.hpa?.min_replicas ?? 0;
-  const hpaMax = status?.cluster.hpa?.max_replicas ?? 0;
-  const p95 = status?.metrics.p95_latency_ms ?? 0;
-  const attempted = bots.reduce((sum, bot) => sum + totalTraffic(bot), 0);
-  const success = bots.reduce((sum, bot) => sum + bot.success, 0);
-  const failure = bots.reduce((sum, bot) => sum + bot.failure, 0);
-  const failureRate = attempted ? failure / attempted : 0;
-  const successPct = attempted ? (success / attempted) * 100 : 100;
-  const activeScenarios = status ? Object.values(status.scenarios).filter(Boolean).length : 0;
-  const externalLoad = activeScenarios > 0 || desired > 2;
-  const botCount = botCountForTarget(targetTraffic);
-  const rawPods = status?.cluster.pods ?? [];
-  const podCount = Math.max(desired, rawPods.length, 1);
-  const podModels = Array.from({ length: podCount }, (_, index) => {
-    const pod = rawPods[index];
-    return {
-      id: pod?.name ?? `pending-${index}`,
-      name: pod ? shortPodName(pod.name) : `생성 중 ${index + 1}`,
-      ready: Boolean(pod?.ready),
-    };
-  });
-  const podTiles = useMemo(() => splitPods(podModels), [podModels]);
-  const badgeState = running ? '부하 설정 중' : externalLoad ? '파드 확장' : failureRate >= 0.25 ? '실패 증가' : '정상';
-  const badgeTone = failureRate >= 0.25 ? 'bad' : running || externalLoad || failureRate > 0 ? 'warn' : 'ok';
-  const operationText = running
-    ? `봇 ${botCount}개가 API 트래픽을 보내는 중`
-    : externalLoad
-      ? '파드 확장 상태입니다. 리셋하면 파드가 2개로 줄어듭니다'
-      : notice;
+    targetTpsRef.current = targetTps;
+  }, [targetTps]);
 
   useEffect(() => {
-    if (timerRef.current) window.clearInterval(timerRef.current);
-    if (!running) return;
+    let raf = 0;
 
-    timerRef.current = window.setInterval(() => {
-      const remaining = targetRef.current - attemptedRef.current;
-      if (remaining <= 0) {
-        setRunning(false);
-        setNotice('목표 트래픽 완료');
+    const draw = (time: number) => {
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        raf = requestAnimationFrame(draw);
         return;
       }
 
-      const batch = clamp(Math.min(remaining, botsRef.current.length * 2), 1, 32);
-      const plans = Array.from({ length: batch }, (_, offset) => pickBotIndex(botsRef.current, attemptedRef.current + offset + 1));
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(1, Math.floor(rect.width * dpr));
+      const height = Math.max(1, Math.floor(rect.height * dpr));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
 
-      const failureRate = targetRef.current >= 850 ? 0.24 : targetRef.current >= 500 ? 0.16 : 0.08;
-      void Promise.allSettled(plans.map((botIndex) => api<WorkResult>('/api/work', {
-        method: 'POST',
-        body: JSON.stringify({ bot_id: `work-bot-${botsRef.current[botIndex]?.id ?? botIndex + 1}`, failure_rate: failureRate }),
-      }))).then((results) => {
-        setBots((current) => {
-          const next = current.map((bot) => ({ ...bot }));
-          results.forEach((result, index) => {
-            const bot = next[plans[index]];
-            if (!bot) return;
-            if (result.status === 'fulfilled' && result.value.ok) bot.success += 1;
-            else bot.failure += 1;
-          });
-          attemptedRef.current = next.reduce((sum, bot) => sum + totalTraffic(bot), 0);
-          if (attemptedRef.current >= targetRef.current) {
-            setRunning(false);
-            setNotice('목표 트래픽 완료');
-          }
-          return next;
-        });
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+      ctx.fillStyle = '#f1f6fb';
+      ctx.fillRect(0, 0, rect.width, rect.height);
+
+      const current = statusRef.current;
+      const pods = current?.cluster.pods ?? [];
+      const desired = Math.max(current?.cluster.desired_replicas ?? 1, pods.length, 1);
+      const models = Array.from({ length: desired }, (_, index) => {
+        const pod = pods[index];
+        return { name: pod ? shortPodName(pod.name) : `생성 중 ${index + 1}`, ready: Boolean(pod?.ready) };
       });
-    }, 420);
+      const boxes = splitBoxes(models);
+      const perPodTps = runningRef.current ? targetTpsRef.current / Math.max(desired, 1) : 0;
+      const baseHeat = clamp(perPodTps / 1000, 0.05, 1);
+
+      boxes.forEach((box, podIndex) => {
+        const x = box.x * rect.width + 5;
+        const y = box.y * rect.height + 5;
+        const w = box.w * rect.width - 10;
+        const h = box.h * rect.height - 10;
+        const cells = runningRef.current ? clamp(Math.ceil(perPodTps / 10), 8, 1000) : 1;
+        const cols = Math.ceil(Math.sqrt(cells * (w / Math.max(h, 1))));
+        const rows = Math.ceil(cells / cols);
+        const cw = w / cols;
+        const ch = h / rows;
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.roundRect(x, y, w, h, 8);
+        ctx.clip();
+
+        for (let i = 0; i < cells; i += 1) {
+          const col = i % cols;
+          const row = Math.floor(i / cols);
+          const wave = Math.sin(time / 200 + i * 0.72 + podIndex) * 0.5 + 0.5;
+          const localHeat = clamp(baseHeat * (0.78 + wave * 0.38), 0.03, 1);
+          const gx = x + col * cw;
+          const gy = y + row * ch;
+          const grad = ctx.createLinearGradient(gx, gy, gx + cw, gy + ch);
+          grad.addColorStop(0, heatColor(localHeat * 0.8, wave * 0.3));
+          grad.addColorStop(1, heatColor(localHeat, wave));
+          ctx.fillStyle = box.ready ? grad : 'rgba(249, 181, 98, .66)';
+          ctx.fillRect(gx, gy, Math.ceil(cw) + 1, Math.ceil(ch) + 1);
+        }
+
+        ctx.fillStyle = 'rgba(255,255,255,.82)';
+        ctx.fillRect(x, y, w, 78);
+        ctx.strokeStyle = box.ready ? 'rgba(101, 163, 113, .55)' : 'rgba(249, 181, 98, .68)';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
+        const labelSize = clamp(w / 13, 11, 16);
+        const stateSize = clamp(w / 8, 16, 28);
+        ctx.fillStyle = '#30415f';
+        ctx.font = `900 ${labelSize}px system-ui, sans-serif`;
+        ctx.fillText(box.name, x + 14, y + 26);
+        ctx.font = `900 ${stateSize}px system-ui, sans-serif`;
+        ctx.fillText(box.ready ? 'Ready' : 'Pending', x + 14, y + 58);
+        ctx.font = '800 12px system-ui, sans-serif';
+        ctx.fillStyle = '#7890aa';
+        ctx.fillText(`${formatCount(perPodTps)} TPS / pod`, x + 14, y + 74);
+        ctx.restore();
+      });
+
+      raf = requestAnimationFrame(draw);
+    };
+
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  useEffect(() => {
+    if (trafficTimer.current) window.clearInterval(trafficTimer.current);
+    if (!running) return;
+
+    trafficTimer.current = window.setInterval(() => {
+      const current = statusRef.current;
+      const pods = Math.max(current?.cluster.ready_replicas ?? current?.cluster.desired_replicas ?? 1, 1);
+      const perPodTps = targetTpsRef.current / pods;
+      const unitsPerTick = Math.max(1, Math.round(targetTpsRef.current / 5));
+      const chunks = Array.from({ length: Math.ceil(unitsPerTick / 1000) }, (_, index) => Math.min(1000, unitsPerTick - index * 1000));
+      const failureRate = failureRateFor(perPodTps);
+
+      void Promise.allSettled(chunks.map((units, index) => api<WorkResult>('/api/work', {
+        method: 'POST',
+        body: JSON.stringify({ bot_id: `work-bot-${index + 1}`, units, failure_rate: failureRate }),
+      }))).then((results) => {
+        let ok = 0;
+        let bad = 0;
+        results.forEach((result) => {
+          if (result.status === 'fulfilled') {
+            ok += result.value.success;
+            bad += result.value.failure;
+          } else {
+            bad += Math.max(1, Math.round(unitsPerTick / chunks.length));
+          }
+        });
+        setSuccess((value) => value + ok);
+        setFailure((value) => value + bad);
+      });
+    }, 200);
 
     return () => {
-      if (timerRef.current) window.clearInterval(timerRef.current);
+      if (trafficTimer.current) window.clearInterval(trafficTimer.current);
     };
-  }, [running, botCount]);
+  }, [running]);
 
-  const setTarget = (next: number) => {
-    const value = clamp(Math.round(next || 1), 1, 1000);
-    setTargetTraffic(value);
-    if (!running && attempted === 0) setBots(createBots(value));
-  };
-
-  const startLoad = async () => {
-    const freshBots = createBots(targetTraffic);
-    setBots(freshBots);
-    botsRef.current = freshBots;
-    attemptedRef.current = 0;
+  const start = () => {
+    setBusy('실행');
+    setSuccess(0);
+    setFailure(0);
     setRunning(true);
-    setBusy('부하 설정');
-    setNotice('부하 설정 중');
-
-    try {
-      await postWithRetry('/api/scenarios/scale-surge/start', 4);
-      await refresh();
-    } catch {
-      setNotice('부하 설정 일부 실패: 실제 응답만 집계합니다');
-    } finally {
-      setBusy('');
-    }
+    setNotice('트래픽 실행 중');
+    setBusy('');
   };
 
-  const resetLoad = async () => {
-    setBusy('리셋');
+  const stop = () => {
+    setBusy('중지');
     setRunning(false);
-    setBots(createBots(targetTraffic));
-    attemptedRef.current = 0;
-    setNotice('리셋 중');
-
-    try {
-      await postWithRetry('/api/releases/rollback', 10);
-      setNotice('리셋 완료');
-      await refresh();
-    } catch {
-      setNotice('리셋 재시도 필요');
-    } finally {
-      setBusy('');
-    }
+    setNotice('중지됨');
+    setBusy('');
   };
+
+  const ready = status?.cluster.ready_replicas ?? 0;
+  const desired = status?.cluster.desired_replicas ?? 0;
+  const p95 = status?.metrics.p95_latency_ms ?? 0;
+  const perPodTps = running ? targetTps / Math.max(ready || desired || 1, 1) : 0;
+  const failRate = success + failure ? Math.round((failure / (success + failure)) * 100) : 0;
 
   return (
     <main className="shell">
       <section className="hero">
         <div>
-          <p>bot-service-02</p>
-          <h1>작업 파드 히트맵</h1>
+          <p>bot-service-02 · 고정 파드 부하 관찰</p>
+          <h1>TPS 파드 히트맵</h1>
         </div>
-        <strong className={`badge ${badgeTone}`}>{badgeState}</strong>
+        <strong className={`badge ${running ? 'warn' : 'ok'}`}>{running ? '실행 중' : '대기'}</strong>
       </section>
 
-      <section className="control-panel" aria-label="부하 제어">
+      <section className="control-panel" aria-label="트래픽 제어">
         <label>
-          <span>목표 트래픽 수</span>
-          <input type="number" min={1} max={1000} value={targetTraffic} onChange={(event) => setTarget(Number(event.target.value))} />
+          <span>목표 TPS</span>
+          <input type="number" min={1} max={10000} value={targetTps} onChange={(event) => setTargetTps(clamp(Number(event.target.value), 1, 10000))} />
         </label>
-        <button className="primary" onClick={startLoad} disabled={!!busy || running}>부하 설정</button>
-        <button onClick={resetLoad} disabled={!!busy}>리셋</button>
+        <button className="primary" onClick={start} disabled={!!busy || running}>실행</button>
+        <button onClick={stop} disabled={!!busy || !running}>중지</button>
       </section>
 
       <section className="definition">
-        <strong>시각화 기준</strong>
-        <span>큰 블록 1개는 실제 Kubernetes 파드 1개입니다. 블록 안 색은 전체 API 응답 기준이며 초록은 성공, 빨강은 실패입니다. 봇 수는 목표 트래픽에 맞춰 숫자로 표시됩니다.</span>
+        <strong>기준</strong>
+        <span>블록 1개는 실제 Kubernetes 파드 1개입니다. 02는 TPS를 입력해도 파드를 자동으로 늘리지 않습니다. 배포 파일의 파드 기준을 늘리면 같은 TPS에서 열감이 내려갑니다.</span>
       </section>
 
       <section className="metrics">
-        <Metric label="봇 수" value={`${botCount}개`} />
-        <Metric label="성공 / 실패" value={`${formatCount(success)} / ${formatCount(failure)}`} tone={failure > 0 ? 'bad' : 'ok'} />
+        <Metric label="목표 TPS" value={formatCount(targetTps)} />
         <Metric label="파드" value={`${ready} / ${desired}`} />
-        <Metric label="요청 완료" value={`${formatCount(attempted)} / ${formatCount(targetTraffic)}`} />
+        <Metric label="파드당 TPS" value={formatCount(perPodTps)} />
+        <Metric label="실패율" value={`${failRate}%`} tone={failRate > 12 ? 'bad' : failRate > 0 ? 'warn' : 'ok'} />
       </section>
 
       <section className="traffic-card">
         <div className="traffic-title">
           <div>
-            <strong>파드 히트맵</strong>
-            <span>{operationText} · HPA {hpaMin}/{hpaMax} · p95 {Math.round(p95)}ms</span>
+            <strong>60fps 파드 히트맵</strong>
+            <span>{notice} · 성공 {formatCount(success)} · 실패 {formatCount(failure)} · p95 {Math.round(p95)}ms · 버전 {status?.version ?? '-'}</span>
           </div>
-          <div className="legend" aria-label="색상 기준">
-            <span><i className="success" />API 성공 {Math.round(successPct)}%</span>
-            <span><i className="failure" />API 실패 {Math.round(failureRate * 100)}%</span>
+          <div className="legend">
+            <span><i className="low" />낮음</span>
+            <span><i className="mid" />주의</span>
+            <span><i className="high" />위험</span>
           </div>
         </div>
-        <div className="pod-map" aria-label="실제 파드 증가 감소 히트맵">
-          {podTiles.map((tile) => {
-            const showText = tile.w * tile.h > 460;
-            return (
-              <article
-                key={tile.id}
-                className={tile.ready ? 'ready' : 'pending'}
-                style={{
-                  left: `${tile.x}%`,
-                  top: `${tile.y}%`,
-                  width: `${tile.w}%`,
-                  height: `${tile.h}%`,
-                  ['--success' as string]: `${successPct}%`,
-                }}
-              >
-                {showText && (
-                  <>
-                    <b>{tile.name}</b>
-                    <strong>{tile.ready ? 'Ready' : 'Pending'}</strong>
-                    <span>성공 {formatCount(success)} · 실패 {formatCount(failure)}</span>
-                  </>
-                )}
-              </article>
-            );
-          })}
-        </div>
-      </section>
-
-      <section className="footer-panel">
-        <div>
-          <span>운영 중 버전</span>
-          <strong>{status?.version ?? '로딩 중'}</strong>
-        </div>
-        <div>
-          <span>리셋 기준</span>
-          <strong>안정 버전 · 파드 2개</strong>
-        </div>
-        <div>
-          <span>DB 누적</span>
-          <strong>{formatCount(status?.rows.jobs ?? 0)}건</strong>
-        </div>
+        <canvas ref={canvasRef} className="pod-canvas" aria-label="TPS 파드 히트맵" />
       </section>
     </main>
   );
