@@ -8,8 +8,7 @@ patches:
     patch: |-
       - op: replace
         path: /spec/template/spec/containers/0/env/3/value
-        value: v1.1.0-bad-schema
+        value: v1.1.0-bad-crash
       - op: replace
         path: /spec/template/spec/containers/0/env/4/value
-        value: bad-schema
-
+        value: bad-crash
