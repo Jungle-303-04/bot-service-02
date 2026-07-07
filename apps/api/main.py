@@ -662,25 +662,45 @@ async def create_order() -> dict[str, Any]:
 
 
 @app.post("/api/work")
-async def work_unit() -> dict[str, Any]:
+async def work_unit(request: Request) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    bot_id = str(payload.get("bot_id", "bot-unknown"))[:64]
+    failure_rate = max(0.0, min(0.8, float(payload.get("failure_rate", 0) or 0)))
     pressure = 0.07 if scenario_state["scale_surge"] or scenario_state["load"] else 0.025
     checksum = local_cpu_work(pressure)
+    failed = random.random() < failure_rate
     async with current_pool().acquire() as conn:
         if SERVICE_KIND == "fleet":
             job_id = await conn.fetchval(
-                "INSERT INTO jobs(status, payload) VALUES('queued', $1::jsonb) RETURNING id",
-                json_arg({"source": "traffic-surge", "checksum": checksum, "service": SERVICE_NAME}),
+                "INSERT INTO jobs(status, payload) VALUES($1, $2::jsonb) RETURNING id",
+                "failed" if failed else "queued",
+                json_arg({"source": "traffic-surge", "bot_id": bot_id, "checksum": checksum, "service": SERVICE_NAME}),
             )
-            await conn.execute("INSERT INTO bot_events(event_type, payload) VALUES('traffic.work', $1::jsonb)", json_arg({"job_id": job_id}))
+            await conn.execute(
+                "INSERT INTO bot_events(event_type, payload) VALUES($1, $2::jsonb)",
+                "traffic.failed" if failed else "traffic.work",
+                json_arg({"job_id": job_id, "bot_id": bot_id}),
+            )
             target_bot = random.randint(1, 18)
             await conn.execute("UPDATE bots SET status = 'busy', current_load = $1, updated_at = now() WHERE id = $2", random.randint(35, 99), target_bot)
         else:
             await conn.execute(
-                "INSERT INTO audit_logs(event_type, payload) VALUES('traffic.work', $1::jsonb)",
-                json_arg({"checksum": checksum, "service": SERVICE_NAME, "at": utc_now()}),
+                "INSERT INTO audit_logs(event_type, payload) VALUES($1, $2::jsonb)",
+                "traffic.failed" if failed else "traffic.work",
+                json_arg({"bot_id": bot_id, "checksum": checksum, "service": SERVICE_NAME, "at": utc_now()}),
             )
-            await conn.execute("INSERT INTO telemetry_samples(metric, value) VALUES('checkout.work', $1)", random.random() * 100)
-    return {"status": "accepted", "checksum": checksum, "service": SERVICE_NAME}
+            await conn.execute(
+                "INSERT INTO telemetry_samples(metric, value) VALUES($1, $2)",
+                "checkout.failed" if failed else "checkout.work",
+                0 if failed else random.random() * 100,
+            )
+    if failed:
+        ERRORS.labels(SERVICE_NAME, "bot_work_failed").inc()
+    return {"ok": not failed, "status": "failed" if failed else "accepted", "bot_id": bot_id, "checksum": checksum, "service": SERVICE_NAME}
 
 
 @app.get("/api/bots")

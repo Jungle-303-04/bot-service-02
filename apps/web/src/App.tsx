@@ -27,6 +27,10 @@ interface Status {
   cluster: Cluster;
 }
 
+interface WorkResult {
+  ok: boolean;
+}
+
 interface BotStat {
   id: number;
   success: number;
@@ -215,13 +219,17 @@ export default function App() {
       const batch = clamp(Math.min(remaining, botsRef.current.length * 2), 1, 32);
       const plans = Array.from({ length: batch }, (_, offset) => pickBotIndex(botsRef.current, attemptedRef.current + offset + 1));
 
-      void Promise.allSettled(plans.map(() => api('/api/work', { method: 'POST' }))).then((results) => {
+      const failureRate = targetRef.current >= 850 ? 0.24 : targetRef.current >= 500 ? 0.16 : 0.08;
+      void Promise.allSettled(plans.map((botIndex) => api<WorkResult>('/api/work', {
+        method: 'POST',
+        body: JSON.stringify({ bot_id: `work-bot-${botsRef.current[botIndex]?.id ?? botIndex + 1}`, failure_rate: failureRate }),
+      }))).then((results) => {
         setBots((current) => {
           const next = current.map((bot) => ({ ...bot }));
           results.forEach((result, index) => {
             const bot = next[plans[index]];
             if (!bot) return;
-            if (result.status === 'fulfilled') bot.success += 1;
+            if (result.status === 'fulfilled' && result.value.ok) bot.success += 1;
             else bot.failure += 1;
           });
           attemptedRef.current = next.reduce((sum, bot) => sum + totalTraffic(bot), 0);
@@ -256,7 +264,6 @@ export default function App() {
 
     try {
       await postWithRetry('/api/scenarios/scale-surge/start', 4);
-      await postWithRetry('/api/scenarios/error-spike/start', 4);
       await refresh();
     } catch {
       setNotice('부하 설정 일부 실패: 실제 응답만 집계합니다');
